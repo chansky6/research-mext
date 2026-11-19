@@ -24,7 +24,7 @@
 | `translations/` | 每篇论文的中文总结 `-总结.md`；部分论文的 `-完整翻译.md` | 新增论文**必须**同时更新 `README.md` 索引 |
 | `translations/README.md` | 索引：总表、一句话速查、按问题聚类、引用关系图、指标口径对照 | 增删论文时同步维护 |
 | 根目录 | 自写报告 / 实验方案 / 调研 | 不含论文 PDF |
-| `xtier/xtier/` | xTier 上游仓库（submodule） | 不在此提交改动 |
+| `code/xtier/` | xTier 上游仓库（submodule）；`code/` 下还会有其他项目代码 | 不在此提交改动 |
 
 ---
 

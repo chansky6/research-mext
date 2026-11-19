@@ -2,7 +2,7 @@
 
 **日期：** 2026-11-18
 **分析对象：** xTier — 用机器学习决定内存页放哪儿的系统（arXiv 2609.27266）
-**代码基础：** `/Users/bbchen/workspace/research-mext/xtier/xtier/`（全开源）
+**代码基础：** `/Users/bbchen/workspace/research-mext/code/xtier/`（全开源）
 
 ---
 

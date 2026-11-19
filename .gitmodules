@@ -1,3 +1,3 @@
-[submodule "xtier/xtier"]
-	path = xtier/xtier
+[submodule "code/xtier"]
+	path = code/xtier
 	url = https://github.com/a85tract/xtier.git
