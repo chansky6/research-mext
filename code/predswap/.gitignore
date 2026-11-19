@@ -1,0 +1,4 @@
+# 构建产物(本地编译 BPF/Rust 交叉产物不上库;目标机部署见 README)
+build/
+daemon/target/
+daemon/.cargo/
