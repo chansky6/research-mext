@@ -23,23 +23,51 @@
 **图 3. xTier 设计总览（原文 Figure 3）。** 图分四层，自上而下正好是"谁来决策、谁来看冷、谁来搬、搬到哪"：
 
 - **最上层（离线，灰色）**：`recurring workload profile`（重复运行的负载画像）→ `offline training`（离线训练）→ `quantization & configuration`（量化与配置）。这是**内核之外**的一次性准备，对应下文"训练约 15 分钟、全自动"。
-- **eBPF runtime（蓝色，热页上移的决策层）**：三张 BPF map 承载状态——`per-page state`（逐页记账）、`quantized model`（INT8 权重）、`policy parameters`（策略参数）。数据流是一条单向管道：`sample handler`（收 PEBS 采样并记账）→ `scoring`（MLP 打分）→ `admission control`（门控：冷静期 / Top-K / 抽签），只有通过门控的页才 `promote` 下去。
+- **eBPF runtime（蓝色，热页上移的决策层）**：三张 BPF map 承载状态——`per-page state`（逐页记账）、`quantized model`（INT8 权重）、`policy parameters`（策略参数）。数据流是一条单向管道：`sample handler`（收 PEBS 采样并记账）→ `scoring`（MLP 打分）→ `admission control`（门控：静态放置排除 / 冷静期 / Top-K 阈值），只有通过门控的页才 `promote` 下去。
 - **Kernel module（灰色，执行层）**：上半部分的 `A-bit scanner` 走 `demote` 路径——扫页表 A 位判冷，然后把页降级；`executor` 既接 eBPF 下来的 `promote` 单，也执行 `migrate` 动作。
 - **最底层（硬件）**：`CPU` 供 PEBS 采样（上行箭头），`DRAM` 与 `CXL` 之间是双向箭头——黑色粗箭头下移（降级到 CXL），蓝色箭头上移（晋升到 DRAM）。
 
 一句话读法：**上面蓝框是"AI 决定谁上"，左边灰框是"硬件位决定谁下"，两者最后由 executor 统一动手，在 DRAM 与 CXL 之间双向搬运。**
 
-### 热页上移：靠"预测"
+### 热页上移：论文附录 Algorithm 1（Hot page promotion）
 
-**先看硬件给了什么**：Intel CPU 有个叫 PEBS 的采样功能——程序每访问若干次内存，CPU 就自动记录一条"某某地址被访问了"。xTier 用一个 eBPF 程序接收这些采样，给每个页记账：这个 epoch（几毫秒的时间片）被访问了几次、过去 6 个 epoch 的访问趋势如何。
+整个上移路径在论文里就是 13 行伪代码。它真正的结构是**先排除、再打分、最后卡阈值**——凡是明显不值得搬的页，都在**推理之前**就被甩掉了：
 
-**然后做预测**：每隔一个 epoch，攒下的"候选页"（还在慢层、可能值得搬上来的页）被送进一个小神经网络（MLP），它给每个页打个分——**预测这个页未来还会不会被频繁访问**。分数高的页胜出。
+```text
+Input : PEBS samples
+Output: Batched promotion intents
 
-**但高分不是终点**，还要过三道关卡：
+ 1  foreach PEBS sample do
+ 2      p ← sampled page
+ 3      if p is stack or executable then
+ 4          Skip p                      // static placement
+ 5      Update page state for p
+ 6      if p is already on DRAM then
+ 7          Skip p                      // no promotion needed
+ 8      if p was promoted recently then
+ 9          Skip p                      // avoid thrashing
+10      s_p ← ML score for p
+11      if s_p > τ_K then
+12          Add p to promotion batch
+13  Submit promotion batch to migration executor
+```
 
-1. **冷静期**：刚搬过的页 15 个 epoch 内不许再搬（防止来回折腾）；
-2. **名额限制**：每个 epoch 只录取分数最高的那一小撮（DRAM 预算有限，装不下所有热页）；
-3. **概率抽签**：最后一道骰子，控制迁移总量。
+| 行 | 动作 | 对应的通俗含义 |
+|---|---|---|
+| 1–2 | 每条 PEBS 采样取一页 | Intel CPU 每访问若干次内存就吐一条"某地址被访问"的记录，这是**唯一的输入信号** |
+| 3–4 | 栈页 / 可执行段 → 跳过 | 静态放置规则：活跃栈通常很小又极热，直接钉在 DRAM；可执行段单独处理，因为"加载退休"类 PEBS 事件反映的是**数据访问**而非取指 |
+| 5 | 更新逐页状态 | 记账：本 epoch 访问次数、跨 epoch 差分、recency、迁移历史——后面模型的 32 个特征就从这里来 |
+| 6–7 | 已在 DRAM → 跳过 | 已经在快层，没有晋升的必要 |
+| 8–9 | 最近搬过 → 跳过 | **冷静期（默认 15 个 epoch）**。注意它排在推理之前：既省掉一次推理，又天然抑制"分数在门槛附近抖动的页"反复来回搬 |
+| 10 | `s_p` ← 模型打分 | 量化后的 INT8 三层 MLP，输出一个**标量分数**（不是概率、不是冷热二分类） |
+| 11–12 | `s_p > τ_K` → 入批 | **名额限制**。`τ_K` 不是写死的常数，而是由用户态控制程序按**上一个 epoch 的分数直方图**算出的阈值，用直方图近似 Top-K 选择——避免在内核里排序全部候选 |
+| 13 | 整批交给 executor | 决策到此结束，搬不搬由下一节的三级接力完成 |
+
+三个要点值得单独拎出来：
+
+1. **阈值为什么能在内核里算得这么便宜**：模型输出被量化到 256 个桶，且以固定零点 32 为"几乎无收益"的落点，所以"按桶设阈值"这件事在内核侧退化成一次整数比较——这就是 `s_p > τ_K` 一行能成立的全部前提。
+2. **算法比实现更简化**：伪代码写成"逐条采样即时比较"，实际是**双缓冲**——遥测往一个缓冲区写候选，推理和阈值计算消费另一个，epoch 边界对调，于是 PEBS 处理从不等前一个 epoch 的推理。
+3. **代码里还有一个论文伪代码没画的闸门**：`admit_prob_q16`（概率准入），默认 0 即关闭（阈值以上 100% 通过）。它存在的意义是可外部调节迁移总量，属于调参旋钮而非默认路径——读伪代码时不用找它。
 
 过关的页排进一个队列，由一个内核模块（executor）取出来，**把相邻的页合并成一整段**，调用一个内核补丁提供的搬家函数，一次性搬到 DRAM。
 
@@ -82,16 +110,36 @@ executor（`xtier_executor.ko`）是一个标准的可动态加载内核模块�
 
 三个角色怎么接上头？靠一张**共享表格**（BPF map，可以理解为内核里一块约定好格式的公告板）：eBPF 往里写单，executor 从里取单，用户态控制程序往里写配置、读统计。谁也不直接叫谁，全靠公告板协作——这也让三方（eBPF、内核模块、用户态程序）能用三种完全不同的技术形态配合工作。
 
-### 冷页下移：靠"硬件的访问位"，完全不靠 AI
+### 冷页下移：论文附录 Algorithm 2（Cold page demotion）
 
-为什么不也用 AI 判冷？因为采样有运气成分——一个还温着的页可能只是碰巧没被采样到，误判会造成灾难（搬下去又得搬回来）。而 CPU 的页表里有个 **Accessed 位**：每次访问硬件自动置 1，**绝对不会漏**。
+下移方向在论文里只有 9 行，而且**完全没有模型**——用的是 CPU 页表里的 **Accessed 位**：每次访问硬件自动置 1，**绝对不会漏**。两边不对称是有意的：误判晋升只是白搬一次，误判降级则会让后续访问都付 CXL 延迟。
 
-executor 模块里有个扫描器，定期遍历工作负载的页表：
+```text
+Input : Page-table scan
+Output: Batched demotion intents
 
-- A 位是 1 → 这页最近被碰过，是温的，把 A 位清零，下次再看；
-- A 位是 0 → **从上次扫描到现在一次都没被访问 → 冷页**，直接打包搬到 CXL。
+ 1  if DRAM occupancy < 70% capacity then
+ 2      Stop scan          // fast tier has free space
+ 3  foreach DRAM page p in scan chunk do
+ 4      if Accessed bit of p is set then
+ 5          Clear Accessed bit
+ 6          Skip p                       // recently used
+ 7      if Accessed bit of p was clear in previous scan then
+ 8          Add p to demotion batch
+ 9  Submit demotion batch to migration executor
+```
 
-这条路径不经过神经网络、不进队列，简单直接。而且很省：只有 DRAM 快被塞满（占用超七成）时才启动扫描，DRAM 有空位就干脆不扫。
+| 行 | 动作 | 对应的通俗含义 |
+|---|---|---|
+| 1–2 | DRAM 占用 < 70% → 停止扫描 | 快层还有空位就**根本不扫**。降级只在"该腾地方"时才启动，这一行就是它便宜的原因 |
+| 3 | 按 chunk 遍历 DRAM 页 | 每次扫 50,000 个页表项、约每秒一轮，且**从上次停下的位置继续**，不重头走完整地址空间——单轮工作量有界 |
+| 4–6 | A 位为 1 → 清零、跳过 | 自我上次来之后被碰过 ⇒ 温的，把位清掉，等下一轮再看 |
+| 7–8 | 上次扫描 A 位也为 0 → 入降级批 | **两次连续观测都为 0** 才判冷。因为每轮访问都会把位重新置 1，"两次都见 0"等价于整个扫描间隔内**一次都没被访问** |
+| 9 | 整批交给同一个 executor | 升/降共用执行器与队列，只是方向不同 |
+
+这里最容易被忽略的一句是论文的措辞：**"Clearing the bit on every visit is what makes the test conservative."** 每轮都把位清掉、只看"敢不敢一直是 0"，筛出来的是"整段区间真的没人碰"，而不是"这一段恰好没被采样到"——这正是不能用 AI 判冷的原因：采样有运气成分，A 位没有。
+
+这九行伪代码也解释了 xTier 为什么能把降级做得这么简单又不误伤：**晋升靠"预测 + 名额"，降级靠"连续缺席 + 只有满的时候才查"**。两个方向的判据完全不同，却挂在同一个容量账本上。
 
 ### 为什么不会"来回折腾"
 
