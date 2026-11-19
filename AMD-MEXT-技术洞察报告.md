@@ -10,7 +10,7 @@
 
 ### 1.1 市场背景：DRAM 成为数据中心的核心成本瓶颈
 
-AMD 在多份文档中反复强调一个判断：**DRAM 已成为数据中心最昂贵的组件**（`AMD-2026-MEXT-WhitePaper-PrimeTime-6thGen-EPYC.pdf`，p.4）。这一判断在 2026 年的行业环境中得到了外部印证：
+AMD 在多份文档中反复强调一个判断：**DRAM 已成为数据中心最昂贵的组件**（`papers/AMD-2026-MEXT-WhitePaper-PrimeTime-6thGen-EPYC.pdf`，p.4）。这一判断在 2026 年的行业环境中得到了外部印证：
 
 - CounterPoint Research 的内存价格跟踪报告显示 DRAM 单位成本持续攀升（白皮书尾注 2 引用，2026 年 2 月报告）；
 - 媒体报道：64GB DDR5 服务器内存条从 2025 年中的 $255 涨至 2026 年 Q1 的 $900 以上（byteiota.com 报道，2026-11）；
@@ -25,7 +25,7 @@ AMD 在多份文档中反复强调一个判断：**DRAM 已成为数据中心最
 
 ### 1.2 MEXT 的定位与目标
 
-根据 `amd-mext-product-brief.pdf`，MEXT 的三大设计要务是：
+根据 `papers/amd-mext-product-brief.pdf`，MEXT 的三大设计要务是：
 
 1. **解决 DRAM 利用率不足问题**；
 2. **以最小硬/软件改动实现——做"即插即用"方案**；
@@ -41,17 +41,17 @@ MEXT 于 2026 年 6 月被 AMD 收购（casrai.org、AMD IT 案例研究），20
 
 ### 2.1 核心机制：冷页卸载 + AI 预测性回流
 
-MEXT 的工作流程在产品简介和三份白皮书中描述一致，可归纳为三步（`amd-mext-product-brief.pdf`，"How It Works"）：
+MEXT 的工作流程在产品简介和三份白皮书中描述一致，可归纳为三步（`papers/amd-mext-product-brief.pdf`，"How It Works"）：
 
 1. **冷页卸载（Cold Page Offload）**：轻量级 Linux 驱动持续采集内存页访问遥测数据，识别热页与冷页，将冷页卸载到专用 NVMe 闪存；
 2. **AI 驱动预测**：AI 引擎持续预测哪些已卸载到闪存的页即将被应用再次访问（从冷变热）；
 3. **预测性回流（Push Back to DRAM）**：在应用真正请求之前，透明地把这些页提前搬回 DRAM，使工作集始终驻留 DRAM。
 
-从应用视角看，"相关内存页永远已经在 DRAM 里"，从而用预测掩盖闪存的高延迟。这与语言模型预测下一个 token 的思路同源——MEXT 的 AI 引擎预测的是**内存页访问序列**（`AMD-2026-MEXT-WhitePaper-PrimeTime-6thGen-EPYC.pdf`，p.6）。
+从应用视角看，"相关内存页永远已经在 DRAM 里"，从而用预测掩盖闪存的高延迟。这与语言模型预测下一个 token 的思路同源——MEXT 的 AI 引擎预测的是**内存页访问序列**（`papers/AMD-2026-MEXT-WhitePaper-PrimeTime-6thGen-EPYC.pdf`，p.6）。
 
 ### 2.2 关键组件
 
-安装指南（`AMD-2026-MEXT-Installation-Guide.pdf`）与白皮书列出的组件略有差异，合并整理如下：
+安装指南（`papers/AMD-2026-MEXT-Installation-Guide.pdf`）与白皮书列出的组件略有差异，合并整理如下：
 
 | 组件                     | 形态                                     | 职责                                                                   |
 | ---------------------- | -------------------------------------- | -------------------------------------------------------------------- |
@@ -83,7 +83,7 @@ MEXT 的工作流程在产品简介和三份白皮书中描述一致，可归纳
 
 ### 2.4 性能数据（AMD 内部测试，均为厂商自报）
 
-**测试 1：EDA 静态时序分析（PrimeTime），EPYC 9686F，512GB 基线**（`AMD-2026-MEXT-WhitePaper-PrimeTime-6thGen-EPYC.pdf`，2026-10/11）：
+**测试 1：EDA 静态时序分析（PrimeTime），EPYC 9686F，512GB 基线**（`papers/AMD-2026-MEXT-WhitePaper-PrimeTime-6thGen-EPYC.pdf`，2026-10/11）：
 
 | 配置                       | 平均耗时    | 相对性能  | 性能/DRAM-美元 |
 | ------------------------ | ------- | ----- | ---------- |
@@ -92,12 +92,12 @@ MEXT 的工作流程在产品简介和三份白皮书中描述一致，可归纳
 | 192GB DRAM + ~320GB MEXT | 12,662s | 90.1% | ~2.40x     |
 | 128GB DRAM + ~378GB MEXT | 14,173s | 80.5% | ~3.22x     |
 
-**测试 2：PrimeTime 大规模场景，EPYC 9755，1.5TB 基线**（`AMD-2026-MEXT-WhitePaper-PrimeTime-1.5TB.pdf`，2026-10）：
+**测试 2：PrimeTime 大规模场景，EPYC 9755，1.5TB 基线**（`papers/AMD-2026-MEXT-WhitePaper-PrimeTime-1.5TB.pdf`，2026-10）：
 
 - 768GB DRAM + 768GB MEXT（总量回补到 1.5TB）：耗时约 112,000s vs 基线约 98,000s，**保留约 87% 性能，性能/DRAM-美元 1.74x**；
 - 同样 50% DRAM 削减但**不开 MEXT**：直接 OOM（无内存安全网时）。
 
-**测试 3：Agentic AI 基准，双路 EPYC 9996，~1TB/路 基线**（`AMD-2026-MEXT-WhitePaper-AgenticAI-6thGen-EPYC.pdf`，2026-11）：
+**测试 3：Agentic AI 基准，双路 EPYC 9996，~1TB/路 基线**（`papers/AMD-2026-MEXT-WhitePaper-AgenticAI-6thGen-EPYC.pdf`，2026-11）：
 
 - 50% DRAM + 512GB MEXT：五角色混合阶段几何平均吞吐 3.921 vs 基线 3.910 tasks/s（**99.7%**），性能/DRAM-美元 ~1.99x；单独的内存密集型图像处理 agent（mtpillow）为 89.7%（1.79x）；
 - 25% DRAM + 768GB MEXT：混合几何平均 85.3%（3.41x），mtpillow 88.4%（3.54x）。
@@ -127,7 +127,7 @@ MEXT 处在一个正在快速成形的"内存分层/扩展"技术版图中。按
 
 - **Meta Vistara**（2026-07 报道）：自研 CXL 芯片把退役服务器的 DDR4 桥接到新 DDR5 服务器（每芯片 256GB DDR4-3200，PCIe Gen5），基于 Linux TPP/TMO 做热页留本地、冷页下沉 CXL 的透明分层。生产部署于百万级服务器，推理服务器数量最多减 25%，缓存延迟降 29%，OOM 失败率降 33%。CXL 扩展功耗仅约 50W，空闲延迟约 250ns、峰值带宽约 48GB/s——但生产中 CXL 带宽利用率常低于 10%，因为冷数据才放 CXL。
 - **学术前沿**（本目录两篇论文 + 检索结果）：
-  - **Camp**（`Liu-2026-ASPLOS-Performance Predictability in Heterogeneous Memory.pdf`，ASPLOS'26）：证明 MPKI、带宽、延迟、停顿周期等**单一指标与 CXL 减速的相关性只有 0.37–0.88**，而基于 12 个 PMU 计数器的因果解析模型可达 0.97；并给出 DRAM–CXL 任意交织比例的闭式性能预测（"Best-shot"策略最多比现有 tiering 提升性能 21%）。**关键启示：页放置决策的"预测"问题有严格的可解结构，热度≠性能影响。**
+  - **Camp**（`papers/Liu-2026-ASPLOS-Performance Predictability in Heterogeneous Memory.pdf`，ASPLOS'26）：证明 MPKI、带宽、延迟、停顿周期等**单一指标与 CXL 减速的相关性只有 0.37–0.88**，而基于 12 个 PMU 计数器的因果解析模型可达 0.97；并给出 DRAM–CXL 任意交织比例的闭式性能预测（"Best-shot"策略最多比现有 tiering 提升性能 21%）。**关键启示：页放置决策的"预测"问题有严格的可解结构，热度≠性能影响。**
   - **Equilibria**（Meta，arXiv 2602.08800）：指出 TPP 之外的 tiering 系统（Memtis、Colloid、NOMAD、HeMem 等）几乎都未上游内核，且普遍不支持多租户公平性；
   - **xTier**（arXiv 2609.27266）：用 eBPF 挂载 PEBS 事件 + INT8 量化 MLP **在内核态做微秒级页排序推理**，稳态占用不足 1 核的 4%，在 DRAM:CXL=1:15 以下的紧配置中 18 种配置里 14 种最快；
   - **Memtis**（TOCS 2026）：利用页访问频率直方图做快速层容量动态再分配；
@@ -144,7 +144,7 @@ MEXT 处在一个正在快速成形的"内存分层/扩展"技术版图中。按
 
 ### 3.4 路线 D：ML 驱动的缓存/分层策略——方法论背景
 
-`Savva-2026-ACMCSUR-Machine Learning-Based Caching and Tiering in Modern Data Storage Systems - A Survey.pdf`（ACM CSUR 58(11), 2026）系统梳理了 ML 在缓存淘汰/准入/预取与分层放置/迁移中的应用，关键结论：
+`papers/Savva-2026-ACMCSUR-Machine Learning-Based Caching and Tiering in Modern Data Storage Systems - A Survey.pdf`（ACM CSUR 58(11), 2026）系统梳理了 ML 在缓存淘汰/准入/预取与分层放置/迁移中的应用，关键结论：
 
 - **三类范式**：离线训练+在线推理、增量在线训练、RL 在线训练；特征以 recency/frequency/最后访问时间/访问序列为主；
 - **DL（尤其 LSTM/Transformer）主导预取**——因为它最擅长捕捉时间/空间相关性，这**在方法论上直接支撑 MEXT "预测页访问序列"的技术选择**；
@@ -219,13 +219,13 @@ MEXT 处在一个正在快速成形的"内存分层/扩展"技术版图中。按
 
 **本地文档（/Users/bbchen/workspace/research-mext/）：**
 
-1. `amd-mext-product-brief.pdf` — MEXT 产品简介（目标、组件、工作原理、PrimeTime 1.5TB 结果摘要）
-2. `AMD-2026-MEXT-WhitePaper-PrimeTime-6thGen-EPYC.pdf` — PrimeTime 白皮书，EPYC 9686F，512GB 基线（2026-11）
-3. `AMD-2026-MEXT-WhitePaper-PrimeTime-1.5TB.pdf` — PrimeTime 白皮书，EPYC 9755，1.5TB 基线（2026-10）
-4. `AMD-2026-MEXT-WhitePaper-AgenticAI-6thGen-EPYC.pdf` — Agentic AI 白皮书，EPYC 9996（2026-11）
-5. `AMD-2026-MEXT-Installation-Guide.pdf` — 安装指南 V1.2（2026-10-08，系统要求/组件/配置/服务管理）
-6. `Liu-2026-ASPLOS-Performance Predictability in Heterogeneous Memory.pdf` — Camp 框架，ASPLOS'26（异构内存性能可预测性）
-7. `Savva-2026-ACMCSUR-Machine Learning-Based Caching and Tiering in Modern Data Storage Systems - A Survey.pdf` — ACM CSUR 58(11), 2026（ML 缓存/分层综述）
+1. `papers/amd-mext-product-brief.pdf` — MEXT 产品简介（目标、组件、工作原理、PrimeTime 1.5TB 结果摘要）
+2. `papers/AMD-2026-MEXT-WhitePaper-PrimeTime-6thGen-EPYC.pdf` — PrimeTime 白皮书，EPYC 9686F，512GB 基线（2026-11）
+3. `papers/AMD-2026-MEXT-WhitePaper-PrimeTime-1.5TB.pdf` — PrimeTime 白皮书，EPYC 9755，1.5TB 基线（2026-10）
+4. `papers/AMD-2026-MEXT-WhitePaper-AgenticAI-6thGen-EPYC.pdf` — Agentic AI 白皮书，EPYC 9996（2026-11）
+5. `papers/AMD-2026-MEXT-Installation-Guide.pdf` — 安装指南 V1.2（2026-10-08，系统要求/组件/配置/服务管理）
+6. `papers/Liu-2026-ASPLOS-Performance Predictability in Heterogeneous Memory.pdf` — Camp 框架，ASPLOS'26（异构内存性能可预测性）
+7. `papers/Savva-2026-ACMCSUR-Machine Learning-Based Caching and Tiering in Modern Data Storage Systems - A Survey.pdf` — ACM CSUR 58(11), 2026（ML 缓存/分层综述）
 
 **外部来源（2026-11-17 检索）：**  
 8\. AMD IT 案例研究：amd.com/en/resources/case-studies/amd-it-avoids-82-of-dram-expansion-costs.html（86→145 台部署，82% 成本规避）  
