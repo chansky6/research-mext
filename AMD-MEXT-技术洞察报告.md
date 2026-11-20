@@ -25,7 +25,7 @@ AMD 在多份文档中反复强调一个判断：**DRAM 已成为数据中心最
 
 ### 1.2 MEXT 的定位与目标
 
-根据 `papers/amd-mext-product-brief.pdf`，MEXT 的三大设计要务是：
+根据 `papers/AMD-2026-MEXT-Product-Brief.pdf`，MEXT 的三大设计要务是：
 
 1. **解决 DRAM 利用率不足问题**；
 2. **以最小硬/软件改动实现——做"即插即用"方案**；
@@ -41,7 +41,7 @@ MEXT 于 2026 年 6 月被 AMD 收购（casrai.org、AMD IT 案例研究），20
 
 ### 2.1 核心机制：冷页卸载 + AI 预测性回流
 
-MEXT 的工作流程在产品简介和三份白皮书中描述一致，可归纳为三步（`papers/amd-mext-product-brief.pdf`，"How It Works"）：
+MEXT 的工作流程在产品简介和三份白皮书中描述一致，可归纳为三步（`papers/AMD-2026-MEXT-Product-Brief.pdf`，"How It Works"）：
 
 1. **冷页卸载（Cold Page Offload）**：轻量级 Linux 驱动持续采集内存页访问遥测数据，识别热页与冷页，将冷页卸载到专用 NVMe 闪存；
 2. **AI 驱动预测**：AI 引擎持续预测哪些已卸载到闪存的页即将被应用再次访问（从冷变热）；
@@ -219,7 +219,7 @@ MEXT 处在一个正在快速成形的"内存分层/扩展"技术版图中。按
 
 **本地文档（/Users/bbchen/workspace/research-mext/）：**
 
-1. `papers/amd-mext-product-brief.pdf` — MEXT 产品简介（目标、组件、工作原理、PrimeTime 1.5TB 结果摘要）
+1. `papers/AMD-2026-MEXT-Product-Brief.pdf` — MEXT 产品简介（目标、组件、工作原理、PrimeTime 1.5TB 结果摘要）
 2. `papers/AMD-2026-MEXT-WhitePaper-PrimeTime-6thGen-EPYC.pdf` — PrimeTime 白皮书，EPYC 9686F，512GB 基线（2026-11）
 3. `papers/AMD-2026-MEXT-WhitePaper-PrimeTime-1.5TB.pdf` — PrimeTime 白皮书，EPYC 9755，1.5TB 基线（2026-10）
 4. `papers/AMD-2026-MEXT-WhitePaper-AgenticAI-6thGen-EPYC.pdf` — Agentic AI 白皮书，EPYC 9996（2026-11）
