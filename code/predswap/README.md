@@ -2,7 +2,7 @@
 
 MEXT 式预测性内存系统的自研实现(对标 AMD MEXT,见根目录《predswap-设计规格.md》v0.2 与《predswap-phase0-探测报告.md》)。
 
-P1 范围:eBPF 双 kprobe 事件流 + miss 配对分类器 + LD_PRELOAD agent(WILLNEED 预取)+ page_idle 页龄 + 卸载控制器(= 基线 B2)+ predswapctl + record/replay。预测引擎(M0–M4)是 P2/P3。
+当前版本：M0–M4 在首次换入缺页出现时预测，在分类器确定 Hit/Major/Late 后记账。M4 后台训练 GRU，默认仅派发经独立窗口验证的短序列规则；agent 在被托管进程内执行 WILLNEED。模型记功不等于应用提速，实测及负结果见规格附录 C。
 
 ## 布局
 
@@ -47,12 +47,23 @@ gcc -O1 -w -o /tmp/offprobe -I/usr/src/kernels/$(uname -r)/include \
 mkdir -p /sys/fs/cgroup/memory/bench0
 echo 100 > /sys/fs/cgroup/memory/bench0/memory.swappiness
 echo 400M > /sys/fs/cgroup/memory/bench0/memory.limit_in_bytes
-/opt/predswap/predswapd run --cgroup /sys/fs/cgroup/memory/bench0 \
-  --budget-mb 400 --headroom-mb 64 [--record /tmp/t.psrec] &
-sh -c "echo $$ > /sys/fs/cgroup/memory/bench0/tasks; exec <负载>"
+PREDSWAP_OFFLOAD_ONLY=1 /opt/predswap/predswapd run --m4-mode off \
+  --cgroup /sys/fs/cgroup/memory/bench0 --budget-mb 400 --headroom-mb 64 &
+sh -c 'echo 0 > /sys/fs/cgroup/memory/bench0/tasks; LD_PRELOAD=/opt/predswap/predswap_agent.so exec "$@"' sh <负载命令及参数>
 /opt/predswap/predswapd status
 /opt/predswap/predswapd replay /tmp/t.psrec
 ```
+
+完整 P：去掉 `PREDSWAP_OFFLOAD_ONLY=1` 和 `--m4-mode off`。默认保留内核 swap 预读，`PREDSWAP_REPLACE_RA=1` 才进入修改主机预读设置的消融模式。`bench/fixed_cb.sh B0 B1 B2 P` 以固定操作数、相同种子测量四组，不以节流后的吞吐或预取请求字节代替性能。
+
+## 应用级评测（memcached）
+
+```sh
+gcc -O2 -Wall -pthread -o /opt/predswap/mcbench bench/mcbench.c -lm   # 目标机
+sh bench/mc_slo.sh B0:4096 B1:2240 P:2240      # 每项 VARIANT:BUDGET_MB
+```
+
+`mc_slo.sh` 每轮重启 memcached（`-m 3072 -t 4`）并在 4 GiB 限额下用 `mcbench preload` 灌满约 2 GB 数据，再把 cgroup 限额压到目标值、静置 5 s，最后用固定 2,000,000 次 GET:SET=95:5 的 Zipf 访问测稳态。B0 不做压缩。SLO 门限以 B0 为准：吞吐 ≥95%，p99 ≤2×。结果 CSV 与每轮 daemon 状态、负载输出都在 `artifacts=` 目录；`err` 非零的轮次不得进入统计。
 
 要点(全部有 Phase 0 实测依据):
 - bridge 需要 `ulimit -l unlimited`;daemon 自己 setrlimit。

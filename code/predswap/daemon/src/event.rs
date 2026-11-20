@@ -53,6 +53,17 @@ pub struct Access {
     pub io_wait_ns: u64,
 }
 
+/// Available at entry, before a fault can be classified as hit, late or major.
+#[derive(Clone, Copy)]
+pub struct Fault { pub tgid: u32, pub tid: u32, pub va: u64, pub ts_ns: u64 }
+
+impl From<&SwapEv> for Fault {
+    fn from(e: &SwapEv) -> Self { Self { tgid:e.tgid, tid:e.tid, va:e.va, ts_ns:e.ts_ns } }
+}
+impl From<&Access> for Fault {
+    fn from(a: &Access) -> Self { Self { tgid:a.tgid, tid:a.tid, va:a.va, ts_ns:a.ts_ns } }
+}
+
 const RETRY_WIN_NS: u64 = 50_000_000; // RETRY 重试配对窗口
 const LATE_WAIT_NS: u64 = 200_000; // 无 miss 重试对超过此时长判 late
 
@@ -80,7 +91,8 @@ impl Classifier {
         }
     }
 
-    pub fn feed(&mut self, ev: &SwapEv) {
+    /// True only at the first swap fault, before the retry/classification wait.
+    pub fn feed(&mut self, ev: &SwapEv) -> bool {
         let key = (ev.tid, ev.va);
         match ev.kind {
             EvKind::Swapin => {
@@ -106,6 +118,7 @@ impl Classifier {
                             self.push_ts(p.t_open, p.tgid, key, kind, 0);
                         }
                         self.pend.insert(key, Pending { t_open: ev.ts_ns, has_miss: false, tgid: ev.tgid });
+                        return true;
                     }
                 }
             }
@@ -116,6 +129,7 @@ impl Classifier {
                 // 无 pending 的 miss(理论上不存在):丢弃,sweep 会兜住关联访问
             }
         }
+        false
     }
 
     fn push_ts(&mut self, ts: u64, tgid: u32, key: (u32, u64), kind: AccessKind, wait: u64) {

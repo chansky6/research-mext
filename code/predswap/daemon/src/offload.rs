@@ -148,17 +148,18 @@ pub fn tick(
         }
     }
     // 最小可选页龄 15s:MEXT 口径最细档;scan 周期粗于 15s 时至少 1 epoch
-    let min_epochs = (15 / cfg.scan_period_s.max(1)).max(1) as u32;
+    let min_epochs = 15u64.div_ceil(cfg.scan_period_s.max(1)) as u32;
     let thr = thr.max(min_epochs);
     stats.threshold_age = Some(thr);
 
     // 3) 选中 + 按 va 排序 + 相邻合并成段
     cands.sort_by_key(|c| (c.pid, c.ri, c.i));
     let mut bytes = 0u64;
+    let page_limit = deficit.div_ceil(4096).min(cfg.max_pageout_bytes / 4096);
     let mut by_proc: std::collections::BTreeMap<u32, Vec<(u64, u64)>> =
         std::collections::BTreeMap::new();
     let mut idx = 0usize;
-    while idx < cands.len() && bytes < cfg.max_pageout_bytes {
+    while idx < cands.len() && bytes / 4096 < page_limit {
         if cands[idx].age < thr {
             idx += 1;
             continue;
@@ -166,8 +167,10 @@ pub fn tick(
         // 段起点:首个达标候选
         let (pid, ri, i0) = (cands[idx].pid, cands[idx].ri, cands[idx].i);
         let mut i1 = i0;
+        let start = idx;
+        let remaining = page_limit - bytes / 4096;
         loop {
-            if idx >= cands.len() || bytes + 4096 > cfg.max_pageout_bytes {
+            if idx >= cands.len() || (idx - start) as u64 >= remaining {
                 break;
             }
             let n = &cands[idx];

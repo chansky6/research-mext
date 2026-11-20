@@ -21,7 +21,9 @@
 #include <sys/mman.h>
 #include <pthread.h>
 
+#ifndef PS_DIR
 #define PS_DIR "/tmp/predswap"
+#endif
 #define PS_AGENT_DIR PS_DIR "/agents"
 #define PS_DAEMON_SOCK PS_DIR "/agent.sock"
 
@@ -51,8 +53,8 @@ static void send_ack(uint64_t req_bytes, uint64_t adv_bytes, int ret)
     struct sockaddr_un sa = {0};
     sa.sun_family = AF_UNIX;
     strcpy(sa.sun_path, PS_DAEMON_SOCK);
-    /* 尽力而为;ACK 丢失由 daemon 侧"有效字节/请求字节"比值监控兜底 */
-    sendto(g_sock, &ack, sizeof ack, 0, (struct sockaddr *)&sa, sizeof sa);
+    /* Feedback is telemetry: a full daemon queue must not stall WILLNEED. */
+    sendto(g_sock, &ack, sizeof ack, MSG_DONTWAIT, (struct sockaddr *)&sa, sizeof sa);
 }
 
 static void *agent_main(void *arg)
@@ -100,7 +102,7 @@ static void agent_ctor(void)
     da.sun_family = AF_UNIX;
     strcpy(da.sun_path, PS_DAEMON_SOCK);
     /* daemon 可能尚未就绪:失败不致命,daemon 侧靠扫描 agents 目录发现我们 */
-    sendto(g_sock, &hello, sizeof hello, 0, (struct sockaddr *)&da, sizeof da);
+    sendto(g_sock, &hello, sizeof hello, MSG_DONTWAIT, (struct sockaddr *)&da, sizeof da);
 
     pthread_t t;
     if (pthread_create(&t, NULL, agent_main, NULL) == 0) {

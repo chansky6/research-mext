@@ -37,6 +37,19 @@ impl Recorder {
         self.w.write_all(&b)
     }
 
+    pub fn dispatch(&mut self, ts_ns: u64, tgid: u32, segs: &[(u64, u64)]) -> io::Result<()> {
+        let mut b = vec![b'D'];
+        b.extend_from_slice(&ts_ns.to_le_bytes());
+        b.extend_from_slice(&tgid.to_le_bytes());
+        b.extend_from_slice(&segs.iter().map(|s| s.1).sum::<u64>().to_le_bytes());
+        b.extend_from_slice(&(segs.len() as u32).to_le_bytes());
+        for &(s, l) in segs {
+            b.extend_from_slice(&s.to_le_bytes());
+            b.extend_from_slice(&l.to_le_bytes());
+        }
+        self.w.write_all(&b)
+    }
+
     pub fn pageout(&mut self, ts_ns: u64, tgid: u32, segs: &[(u64, u64)], ret: i64) -> io::Result<()> {
         let mut b = vec![b'P'];
         b.extend_from_slice(&ts_ns.to_le_bytes());
@@ -64,6 +77,14 @@ pub enum RecItem {
         #[allow(dead_code)]
         tgid: u32,
         ret: i64,
+        segs: Vec<(u64, u64)>,
+    },
+    Dispatch {
+        #[allow(dead_code)]
+        ts_ns: u64,
+        #[allow(dead_code)]
+        tgid: u32,
+        bytes: u64,
         segs: Vec<(u64, u64)>,
     },
 }
@@ -99,6 +120,24 @@ pub fn read_all(path: &Path) -> io::Result<Vec<RecItem>> {
                 let wait = u32::from_le_bytes(data[p+22..p+26].try_into().unwrap()) as u64;
                 out.push(RecItem::Access(Access { ts_ns: ts, va, tgid, tid: 0, kind, io_wait_ns: wait }));
                 p = end;
+            }
+            b'D' => {
+                if p + 24 > data.len() { break; }
+                let ts = u64::from_le_bytes(data[p+1..p+9].try_into().unwrap());
+                let tgid = u32::from_le_bytes(data[p+9..p+13].try_into().unwrap());
+                let bytes = u64::from_le_bytes(data[p+13..p+21].try_into().unwrap());
+                let nseg = u32::from_le_bytes(data[p+21..p+25].try_into().unwrap()) as usize;
+                let mut segs = Vec::with_capacity(nseg);
+                for k in 0..nseg {
+                    let q = p + 25 + k * 16;
+                    if q + 16 > data.len() { segs.clear(); break; }
+                    segs.push((
+                        u64::from_le_bytes(data[q..q+8].try_into().unwrap()),
+                        u64::from_le_bytes(data[q+8..q+16].try_into().unwrap()),
+                    ));
+                }
+                out.push(RecItem::Dispatch { ts_ns: ts, tgid, bytes, segs });
+                p = p + 25 + nseg * 16;
             }
             b'P' => {
                 if p + 24 > data.len() { break; }
