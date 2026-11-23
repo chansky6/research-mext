@@ -90,6 +90,8 @@ int main(int argc, char **argv) {
     if (spe_init() != 0) return 1;
     pol_init();
     exec_init();
+    if (fault_ch_init(G.pid) != 0)
+        fprintf(stderr, "[!] fault channel unavailable; prefetch degraded to sample-based\n");
     spe_rescan_threads();
     pol_load_meta();
 
@@ -104,6 +106,7 @@ int main(int argc, char **argv) {
         poll(&pfd, 0, to_ms);   // sleep slice; aux rings are polled by drain
 
         spe_drain_all(pol_sample, NULL);
+        fault_ch_poll();
 
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);

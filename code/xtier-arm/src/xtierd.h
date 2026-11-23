@@ -134,6 +134,10 @@ uint64_t mlp_forward_(const uint8_t in[L0_IN]);
 // spe.c interval adaptation
 void spe_set_interval(uint64_t period);
 
+// fault_ch.c (do_swap_page kprobe channel)
+int fault_ch_init(pid_t pid);
+void fault_ch_poll(void);
+
 // policy demotion pool
 struct dem_cand { uint64_t page; int32_t score; uint32_t last_seen; };
 struct dem_cand *pol_dem_pool(void);

@@ -9,8 +9,12 @@ BENCH = bench/zipf_chase bench/phase_zipf
 
 all: $(BIN) $(BENCH)
 
-src/xtierd: src/xtierd.c src/spe.c src/policy.c src/exec.c src/xtierd.h $(MODEL_HDR)
-	$(CC) $(CFLAGS) $(INC) -o $@ src/xtierd.c src/spe.c src/policy.c src/exec.c -lm
+src/xtierd: src/xtierd.c src/spe.c src/policy.c src/exec.c src/fault_ch.c src/xtierd.h $(MODEL_HDR) src/fault_kern.o
+	$(CC) $(CFLAGS) $(INC) -o $@ src/xtierd.c src/spe.c src/policy.c src/exec.c src/fault_ch.c -lbpf -lelf -lz -lm
+
+src/fault_kern.o: bpf/fault_kern.c
+	LLVM ?= /opt/homebrew/opt/llvm/bin
+	$(LLVM)/clang -target bpfel -O2 -g -Wall -Werror -c $< -o $@
 
 ml/models/mlp_q8_bootstrap.h: ml/bootstrap_model.py
 	python3 ml/bootstrap_model.py $@
