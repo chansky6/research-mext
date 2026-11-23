@@ -260,3 +260,17 @@ void spe_drain_all(spe_sample_fn cb, void *ctx) {
 }
 
 uint64_t spe_sample_count(void) { return total_samples; }
+
+// Interval adaptation: 5.10 arm_spe honors PERF_EVENT_IOC_PERIOD (hwc
+// sample_period + stop/start reprogram). Halve when sample density is too
+// low to rank (exp9: 2K samples/epoch starved the ML pool), double when
+// decode overhead dominates. Min = PMU min_interval (1024), cap 65536.
+void spe_set_interval(uint64_t period) {
+    if (period < 1024) period = 1024;
+    if (period > 65536) period = 65536;
+    for (int i = 0; i < n_rings; i++) {
+        int ret = ioctl(rings[i].fd, PERF_EVENT_IOC_PERIOD, &period);
+        if (ret != 0) { /* keep old interval on this ring */ }
+    }
+    G.spe_interval = (int)period;
+}

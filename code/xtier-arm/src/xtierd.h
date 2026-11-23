@@ -131,6 +131,9 @@ struct pstate *pol_state_peek(uint32_t idx, uint64_t *page_out);
 uint32_t pol_state_slots(void);
 uint64_t mlp_forward_(const uint8_t in[L0_IN]);
 
+// spe.c interval adaptation
+void spe_set_interval(uint64_t period);
+
 // policy demotion pool
 struct dem_cand { uint64_t page; int32_t score; uint32_t last_seen; };
 struct dem_cand *pol_dem_pool(void);
@@ -138,6 +141,8 @@ uint32_t pol_dem_n(void);
 
 // exec.c
 void exec_init(void);
+void pref_note_fault(uint64_t page);
+void pref_start(void);
 void exec_epoch(uint32_t ep_fin);
 void exec_second(FILE *exec_csv);
 uint64_t exec_resident_pages(void);
@@ -146,6 +151,7 @@ struct exec_stats {
     uint64_t cold_found, cold_scanned, cold_passes;
     uint64_t majflt_cum, pswpin_cum, pswpout_cum;
     uint64_t storm_epochs;
+    uint64_t pref_pages, pref_regions;
 };
 extern struct exec_stats XSTATS;
 #endif

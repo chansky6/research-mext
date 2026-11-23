@@ -193,3 +193,10 @@ daemon 失效"是部署该方案时的必要注意事项。
   是内存混淆（MLP 组驻留 3.19GB vs LRU 2.5GB）。预算执行仅 65MB/63epoch——候选
   发现通道（page_idle 逐页查询 + 2K samples/epoch）是瓶颈，不是模型。
 - 详见根目录《xtier-arm-复现报告.md》补充一节。
+
+### exp11/12（三机制上线，2026-11-24 凌晨）
+- 批量冷发现（pagemap 批读 + page_idle 字缓存）/fault 邻域预取（region 级批量
+  process_vm_readv，worker 线程）/SPE interval 自适应（[4K,32K) samples/epoch 窗口）。
+- **等预算吞吐 2.22×**（MLP 701.0s vs 内核 LRU 1559.1s，同夜同探针）；预算执行
+  11.1GB 换出、冷发现 285 万页。机器漂移 5× 已确认并更正早前开销估计。
+- 预取 worker 暂停阈值 bug（8000 < 16K 地板 → 全程瘫痪）已修（24000，待重测）。

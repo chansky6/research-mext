@@ -271,7 +271,7 @@ void pol_sample(void *ctx, uint64_t page, int is_store) {
     // cooldown window (equivalent to the kernel putting a faulted page on
     // the active list). Without this, collapsed sampling re-demoted just-
     // faulted hot pages every cooldown expiry (exp6b thrash spiral).
-    if (st->tier == 2) { st->tier = 1; st->last_mig_epoch = cur_epoch; }
+    if (st->tier == 2) { st->tier = 1; st->last_mig_epoch = cur_epoch; pref_note_fault(page); }
     if (st->last_enq_epoch == cur_epoch) return;
     st->last_enq_epoch = cur_epoch;
     if (pol_epoch_cnt < MAX_PAGES_PER_EPOCH) pol_epoch_pages[pol_epoch_cnt++] = page;

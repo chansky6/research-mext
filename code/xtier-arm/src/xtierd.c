@@ -85,7 +85,7 @@ int main(int argc, char **argv) {
       if (stats_csv) { fprintf(stats_csv, "epoch,pages,inferences,keep,dem_cands,thresh,proc_ms\n"); } }
     { const char *p = getenv("XTIER_EXEC_CSV");
       exec_csv = fopen(p ? p : "exec.csv", "w");
-      if (exec_csv) { fprintf(exec_csv, "t_s,dmajflt_s,pswpin_s,pswpout_s,resident_pages,demote_ok,demote_fail,cold_found,majflt_cum,cold_scanned\n"); } }
+      if (exec_csv) { fprintf(exec_csv, "t_s,dmajflt_s,pswpin_s,pswpout_s,resident_pages,demote_ok,demote_fail,cold_found,majflt_cum,cold_scanned,pref_pages,pref_regions\n"); } }
 
     if (spe_init() != 0) return 1;
     pol_init();
@@ -123,6 +123,27 @@ int main(int argc, char **argv) {
             pol_process_epoch(ep_fin, features_csv, stats_csv);
             exec_epoch(ep_fin);
             pol_next_epoch();
+            // SPE interval adaptation: keep sample density inside the
+            // rankable window [4K, 32K) samples/epoch. Reacts every 4 epochs.
+            {
+                static uint64_t last_samp;
+                static uint32_t adapt_tick;
+                if (++adapt_tick >= 4) {
+                    adapt_tick = 0;
+                    uint64_t cur_samp = spe_sample_count();
+                    uint64_t delta = cur_samp - last_samp;   // per ~4 epochs
+                    last_samp = cur_samp;
+                    if (delta / 4 < 4000 && G.spe_interval > 1024) {
+                        spe_set_interval((uint64_t)G.spe_interval / 2);
+                        printf("[ADAPT] samples/epoch=%llu -> interval=%d\n",
+                               (unsigned long long)(delta / 4), G.spe_interval);
+                    } else if (delta / 4 > 32000 && G.spe_interval < 65536) {
+                        spe_set_interval((uint64_t)G.spe_interval * 2);
+                        printf("[ADAPT] samples/epoch=%llu -> interval=%d\n",
+                               (unsigned long long)(delta / 4), G.spe_interval);
+                    }
+                }
+            }
             last_ep = now;
         }
     }
