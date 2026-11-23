@@ -144,6 +144,7 @@ void exec_init(void);
 void pref_note_fault(uint64_t page);
 void pref_note_score(uint64_t page, int32_t raw, uint32_t epoch);
 void pref_note_epoch(uint32_t epoch);
+uint32_t pol_rb_take(uint64_t *out, uint32_t max);
 void pref_start(void);
 void exec_epoch(uint32_t ep_fin);
 void exec_second(FILE *exec_csv);
@@ -154,6 +155,7 @@ struct exec_stats {
     uint64_t majflt_cum, pswpin_cum, pswpout_cum;
     uint64_t storm_epochs;
     uint64_t pref_pages, pref_regions;
+    uint64_t rb_flips;
 };
 extern struct exec_stats XSTATS;
 #endif

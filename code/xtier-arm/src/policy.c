@@ -246,6 +246,23 @@ static inline uint32_t prandom(void) { uint32_t x = rng_state; x ^= x << 13; x ^
 
 static uint64_t samples_rx, inferences, epoch_inf;
 
+// ---- tier readback ring (xTier us_verify port) ----
+// The daemon is blind to KERNEL demotions: without this, a kernel-swapped
+// page keeps tier=1, the fault-back transition never fires, and the prefetch
+// trigger never sees anything (exp16). Subsample recently-sampled tier-1
+// pages; the 1Hz readback flips them to tier=2 if the kernel swapped them.
+#define RB_RING 65536
+static uint64_t rb_pages[RB_RING];
+static uint32_t rb_head, rb_tail;
+uint32_t pol_rb_take(uint64_t *out, uint32_t max) {
+    uint32_t n = 0;
+    while (rb_tail != rb_head && n < max) {
+        uint64_t pg = rb_pages[rb_tail++ & (RB_RING - 1)];
+        if (pg) out[n++] = pg;
+    }
+    return n;
+}
+
 void pol_sample(void *ctx, uint64_t page, int is_store) {
     (void)ctx; (void)is_store;
     samples_rx++;
@@ -272,7 +289,11 @@ void pol_sample(void *ctx, uint64_t page, int is_store) {
     // the active list). Without this, collapsed sampling re-demoted just-
     // faulted hot pages every cooldown expiry (exp6b thrash spiral).
     if (st->tier == 2) { st->tier = 1; st->last_mig_epoch = cur_epoch; pref_note_fault(page); }
-    if (st->last_enq_epoch == cur_epoch) return;
+    if (st->last_enq_epoch == cur_epoch) {
+        if ((prandom() & 15u) == 0 && (rb_head - rb_tail) < RB_RING)
+            rb_pages[rb_head++ & (RB_RING - 1)] = page;   // tier readback candidate
+        return;
+    }
     st->last_enq_epoch = cur_epoch;
     if (pol_epoch_cnt < MAX_PAGES_PER_EPOCH) pol_epoch_pages[pol_epoch_cnt++] = page;
 }

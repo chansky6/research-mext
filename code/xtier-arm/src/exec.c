@@ -274,6 +274,7 @@ static uint32_t reg_epoch[1024];
 static volatile int pref_run;
 static uint32_t pref_bps = PFR_PAGES_PER_SEC;
 static uint32_t pref_pause = 24000;       // XTIER_PREF_PAUSE: pswpin/s spiral guard
+static int pref_ml_gate = 1;              // XTIER_PREF_ML_GATE: 0 for cliff-regime workloads
 
 // ---- demotion/prefetch shared ledger (exp13: without it the two channels
 // ---- ping-ponged the same regions at 16MB/s each way; resident pinned at
@@ -351,16 +352,24 @@ static void *pref_worker(void *arg) {
         uint32_t idx = (uint32_t)((region >> 21) & 1023);
         uint32_t d = atomic_load(&reg_dem_epoch[idx]);
         if (d != 0 && ep >= d && ep - d < G.cooldown_epochs) continue;
-        // --- suppression rule 2: ML admission ---
-        // Only regions with a fresh (<=2 epochs) positive-benefit score get
-        // prefetch; cold or unscored regions stay out.
-        uint32_t se = atomic_load(&reg_score_epoch[idx]);
-        if (se == 0 || ep < se || ep - se > 2) continue;
-        if ((int32_t)atomic_load(&reg_score_val[idx]) <= 0) continue;
+        // --- suppression rule 2: ML admission (XTIER_PREF_ML_GATE=0 to skip) ---
+        // Blocks unscored/negative regions. On cliff workloads (steep zipf) the
+        // pages that MOST deserve prefetch are cold-region first touches the
+        // model correctly scores cold, so the gate is per-workload.
+        if (pref_ml_gate) {
+            uint32_t se = atomic_load(&reg_score_epoch[idx]);
+            if (se == 0 || ep < se || ep - se > 2) continue;
+            if ((int32_t)atomic_load(&reg_score_val[idx]) <= 0) continue;
+        }
         // --- suppression rule 3: net-flow breaker ---
         // If swap-in runs at ~2x+ our own demotion rate, the two channels are
-        // cancelling: stand down until the ratio recovers.
-        if (storm_ewma_pswpin > 2ull * atomic_load(&dem_ewma) + 4096) { usleep(100000); continue; }
+        // cancelling: stand down until the ratio recovers. Inactive when we
+        // are not demoting (prefetch-only mode): with dem_ewma=0 the threshold
+        // degenerates to 4096 and blocks prefetch forever (exp16).
+        {
+            uint32_t dem = atomic_load(&dem_ewma);
+            if (dem > 100 && storm_ewma_pswpin > 2ull * dem + 4096) { usleep(100000); continue; }
+        }
 
         ssize_t r = pread(pagemap_fd, pm, sizeof(pm), (off_t)(region / 4096 * 8));
         if (r <= 0) continue;
@@ -398,6 +407,8 @@ void pref_start(void) {
     if (e && *e) { uint32_t v = (uint32_t)strtoul(e, NULL, 10); if (v) pref_bps = v; }
     const char *pe = getenv("XTIER_PREF_PAUSE");
     if (pe && *pe) { uint32_t v = (uint32_t)strtoul(pe, NULL, 10); if (v) pref_pause = v; }
+    { const char *g = getenv("XTIER_PREF_ML_GATE");
+      if (g && *g) pref_ml_gate = atoi(g); }
     pref_run = 1;
     pthread_t tid;
     if (pthread_create(&tid, NULL, pref_worker, NULL) != 0) perror("prefetch thread");
@@ -433,7 +444,24 @@ static uint64_t read_majflt(void) {
     return c ? strtoull(c + 1, NULL, 10) : 0;
 }
 
+// 1Hz tier readback: pagemap-check recently sampled pages; kernel-swapped
+// ones flip to tier=2, arming the fault->prefetch trigger and correcting the
+// ML pool's residency view.
+static void exec_readback(void) {
+    static uint64_t pages[2048];
+    uint32_t n = pol_rb_take(pages, 2048);
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t ent;
+        if (pread(pagemap_fd, &ent, 8, (off_t)(pages[i] / 4096 * 8)) != 8) continue;
+        if (!((ent >> 63) & 1) && ((ent >> 62) & 1)) {
+            struct pstate *st = pol_state_get(pages[i], 0);
+            if (st && st->tier == 1) { st->tier = 2; XSTATS.rb_flips++; }
+        }
+    }
+}
+
 void exec_second(FILE *stats_csv) {
+    exec_readback();
     XSTATS.majflt_cum = read_majflt();
     uint64_t pi = 0, po = 0;
     read_vmstat(&pi, &po);
