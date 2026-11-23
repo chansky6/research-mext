@@ -162,3 +162,25 @@ MLP 在更少的降级量下取得最少的回 fault：每次降级的回 fault 
 - XTIER_SCORER=recency/ewma 补全消融；
 - phase_zipf 相位变化实验（对应 xTier figures/plot_phase_response）；
 - 与内核 LRU（高 swappiness、无 ML）基线的 A/B：同一负载、无 xtierd 对照组。
+
+
+### MLP vs 内核 LRU 降级对照（exp5，2026-11-23）
+
+设计：同负载（zipf_chase 3GB/θ0.9/8 线程/300Mops）、同等效 DRAM 预算 2.5GB、
+swappiness=100。
+- `lru` 基线：cgroup v1 `memory.limit_in_bytes=2.5GB` 硬限，内核 LRU 挑受害者，无 daemon；
+- `mlp`：cgroup 2.9GB 留余量，daemon 按 MLP 排序主动降级到 2.5GB（exp4 教训：
+  硬限先于 daemon 触发时 demote_ok=0，daemon 必须有 headroom 才能抢在内核前选人）。
+
+| | majflt 总量 | majflt/s | VmSwap 终值 |
+|---|---|---|---|
+| 内核 LRU（cgroup 2.5GB） | 1,511,160 | 11,621 | 722 MB |
+| **MLP daemon（2.5GB 预算）** | **635,849** | **~4,890** | **377 MB** |
+
+**回 fault 降 ~2.4×，换出量减 ~1.9×。**
+
+诚实脚注：mlp 组的实际驻留 ~2.82GB（内核仍按 2.9GB 上限参与了回收，
+daemon 实际只降了 9 万页），即受害者选择是 MLP+内核混合，2.4× 是混合策略
+对纯 LRU 的下界；两组 Trial 都未在 130s 内跑完 300 Mops（thrash 区），吞吐对比
+需更长运行窗口。另 exp4 第一轮（无 headroom）暴露的"cgroup 硬限先触发则
+daemon 失效"是部署该方案时的必要注意事项。
