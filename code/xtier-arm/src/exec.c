@@ -28,11 +28,28 @@
 #define MAX_IOV 1024              // UIO_MAXIOV: process_madvise iovcnt cap
 
 struct exec_stats XSTATS;
+
+static uint32_t storm_threshold = 16000;   // XTIER_STORM_PSWPIN; ON above the ~12K demand-churn floor
+static uint64_t storm_ewma_pswpin;        // EWMA of swap-in pages/s
+
+static void read_vmstat_cum(uint64_t *pswpin, uint64_t *pswpout) {
+    FILE *f = fopen("/proc/vmstat", "r");
+    if (!f) { *pswpin = *pswpout = 0; return; }
+    char k[64]; unsigned long long v;
+    while (fscanf(f, "%63s %llu", k, &v) == 2) {
+        if (!strcmp(k, "pswpin")) *pswpin = v;
+        else if (!strcmp(k, "pswpout")) *pswpout = v;
+    }
+    fclose(f);
+}
+
+
 static int pidfd = -1;
 static int pagemap_fd = -1;
 static int pageidle_fd = -1;
 
 void exec_init(void) {
+    if (G.storm_pswpin > 0) storm_threshold = G.storm_pswpin;
     char p[64];
     pidfd = (int)syscall(SYS_pidfd_open, (int)G.pid, 0);
     if (pidfd < 0) { perror("pidfd_open"); exit(1); }
@@ -182,16 +199,7 @@ static uint32_t cold_scan_chunk(uint64_t *out, uint32_t max_out, uint32_t *n_out
 
 // ---- 1Hz: majflt / swap traffic ----
 static uint64_t last_majflt, last_pswpin, last_pswpout;
-static void read_vmstat(uint64_t *pswpin, uint64_t *pswpout) {
-    FILE *f = fopen("/proc/vmstat", "r");
-    if (!f) { *pswpin = *pswpout = 0; return; }
-    char k[64]; unsigned long long v;
-    while (fscanf(f, "%63s %llu", k, &v) == 2) {
-        if (!strcmp(k, "pswpin")) *pswpin = v;
-        else if (!strcmp(k, "pswpout")) *pswpout = v;
-    }
-    fclose(f);
-}
+static void read_vmstat(uint64_t *pswpin, uint64_t *pswpout) { read_vmstat_cum(pswpin, pswpout); }
 static uint64_t read_majflt(void) {
     char p[64];
     snprintf(p, sizeof(p), "/proc/%d/stat", (int)G.pid);
@@ -232,11 +240,49 @@ void exec_epoch(uint32_t ep_fin) {
     if (G.mode != 3) return;
     if (G.budget_pages == 0) return;
 
+    // Fix 4 (fault-storm stand-down): when swap-in rate dwarfs what the SSD
+    // can sustain, every daemon demotion just re-poisons the swapped set with
+    // hot pages (exp6b: pswpin collapsed-sampling spiral reached 26K faults/s,
+    // 2.2x worse than kernel LRU). Stand down the ML channel; the idle-bit
+    // cold scan keeps running (hardware evidence), the kernel owns the rest.
+    uint64_t pi_cum = 0, po_cum = 0;
+    read_vmstat_cum(&pi_cum, &po_cum);
+    int storm_on;
+    {
+        static uint64_t last_pi;
+        static struct timespec last_t;
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        double dt = (now.tv_sec - last_t.tv_sec) + (now.tv_nsec - last_t.tv_nsec) / 1e9;
+        if (dt < 0.05) dt = 0.05;
+        double cur = (double)(pi_cum - last_pi) / dt;   // pages/s
+        last_pi = pi_cum; last_t = now;
+        storm_ewma_pswpin = (uint64_t)(storm_ewma_pswpin * 0.7 + cur * 0.3);
+        // Hysteresis state machine. The demand-churn floor at this budget
+        // measured ~10-12K pswpin/s on every config (exp5/6/7), so the ON
+        // threshold sits above it: the gate must catch the 26K spiral
+        // (exp6b), not the irreducible churn. OFF threshold keeps it from
+        // oscillating at the floor.
+        static int storm_state = 0;
+        if (!storm_state && storm_ewma_pswpin > storm_threshold) {
+            storm_state = 1;
+            printf("[STORM] ON  (pswpin ewma=%llu > %u) -- ML channel standing down\n",
+                   (unsigned long long)storm_ewma_pswpin, storm_threshold);
+        } else if (storm_state && storm_ewma_pswpin < storm_threshold * 85 / 100) {
+            storm_state = 0;
+            printf("[STORM] OFF (pswpin ewma=%llu) -- ML channel rearming\n",
+                   (unsigned long long)storm_ewma_pswpin);
+        }
+        if (storm_state) XSTATS.storm_epochs++;
+        storm_on = storm_state;
+    }
+
     uint64_t resident = exec_resident_pages();
     if (resident <= G.budget_pages) return;
     uint64_t over = resident - G.budget_pages;
 
-    // candidates: cold-scan pages first (score -500), then ML pool
+    // Cold-scan demotion ALWAYS runs (hardware idle-bit evidence, not
+    // sample-based): exp7's early-return gated it too, freezing the daemon
+    // completely.
     static uint64_t cold_out[1024];
     uint32_t n_cold = 0;
     cold_scan_chunk(cold_out, 1024, &n_cold);
@@ -247,6 +293,7 @@ void exec_epoch(uint32_t ep_fin) {
         exec_demote(cold_out, n);
         budget -= n;
     }
+    if (storm_on) return;   // fault storm: only hardware-evidence demotion continues
     if (budget > 0) {
         // take the lowest-scored ML candidates, in 1024-page chunks
         // (MAX_IOV iovecs per process_madvise call), until the epoch budget

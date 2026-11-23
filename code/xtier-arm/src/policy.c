@@ -265,8 +265,13 @@ void pol_sample(void *ctx, uint64_t page, int is_store) {
     }
     st->cur_hits++;
     st->owner_pid = (uint32_t)G.pid;
-    // a sample on a swapped page means the access faulted it back in
-    if (st->tier == 2) st->tier = 1;
+    // a sample on a swapped page means the access faulted it back in.
+    // Fix 1 (fault-back pinning): anchor the cooldown NOW — the page just
+    // proved it is accessed, so it must not be a demotion candidate for the
+    // cooldown window (equivalent to the kernel putting a faulted page on
+    // the active list). Without this, collapsed sampling re-demoted just-
+    // faulted hot pages every cooldown expiry (exp6b thrash spiral).
+    if (st->tier == 2) { st->tier = 1; st->last_mig_epoch = cur_epoch; }
     if (st->last_enq_epoch == cur_epoch) return;
     st->last_enq_epoch = cur_epoch;
     if (pol_epoch_cnt < MAX_PAGES_PER_EPOCH) pol_epoch_pages[pol_epoch_cnt++] = page;
@@ -407,7 +412,14 @@ void pol_process_epoch(uint32_t ep_fin, FILE *features_csv, FILE *stats_csv) {
         if (st->tier == 1) {
             // resident: demotion candidate unless the score clears the top-K gate
             uint32_t thresh = G.thresh_dyn > 0 ? G.thresh_dyn : 1;
-            if (raw <= (int32_t)thresh && dem_pool) {
+            // Fix 2 (demotion eligibility gate): require evidence across epochs.
+            // A single-epoch sighting under collapsed sampling is indistinguishable
+            // hot vs cold (exp6b: sample density fell 5x, every page looked
+            // "1 hit, cold", and the daemon re-demoted just-faulted hot pages).
+            // The heuristic-cold path (COLD_EPOCHS of zero hits) and the idle-bit
+            // cold scan keep their own stronger evidence and are unaffected.
+            int multi_epoch = (row.hits >= 2) || row.hits_prev[0] > 0 || row.hits_prev[1] > 0;
+            if (raw <= (int32_t)thresh && multi_epoch && dem_pool) {
                 if (dem_n < MAX_PAGES_PER_EPOCH)
                     dem_pool[dem_n++] = (struct dem_cand){ .page = page, .score = raw, .last_seen = st->last_epoch_seen };
             } else {

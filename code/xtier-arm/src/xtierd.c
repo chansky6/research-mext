@@ -51,6 +51,8 @@ int main(int argc, char **argv) {
       if (e && *e) { double v = atof(e); if (v > 0 && v < 1) G.topk_admit_fraction = v; } }
     { const char *e = getenv("XTIER_COOLDOWN_EPOCHS");
       if (e && *e) { int v = atoi(e); if (v >= 0) G.cooldown_epochs = (uint32_t)v; } }
+    { const char *e = getenv("XTIER_STORM_PSWPIN");
+      if (e && *e) { int v = atoi(e); if (v > 0) G.storm_pswpin = (uint32_t)v; } }
     { const char *sc = getenv("XTIER_SCORER");
       if (sc && *sc) {
           static const char *names[] = { "mlp", "freq", "recency", "ewma", "random" };

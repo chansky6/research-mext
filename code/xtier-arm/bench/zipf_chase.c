@@ -22,6 +22,8 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <omp.h>
+#include <unistd.h>
+#include <pthread.h>
 
 #define PG 4096
 #define BLOCK (2u<<20)
@@ -29,6 +31,18 @@
 #define SLOTS (PG/8)            // u64 slots per page = 512
 #define SEQLEN (1u<<22)         // per-thread zipf sequence length
 
+static void *ops_probe_main(void *arg) {
+    struct opc { unsigned long v; char pad[56]; } *cnt = (struct opc *)arg;
+    unsigned long prev = 0;
+    while (1) {
+        sleep(1);
+        unsigned long s = 0;
+        for (int i = 0; i < 257; i++) s += cnt[i].v;
+        fprintf(stderr, "OPS/s %lu\n", s - prev);
+        prev = s;
+    }
+    return NULL;
+}
 static inline double now_s(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec + ts.tv_nsec*1e-9; }
 static inline uint64_t xr(uint64_t *s){ uint64_t x=*s; x^=x<<13; x^=x>>7; x^=x<<17; return *s=x; }
 
@@ -79,6 +93,13 @@ int main(int argc, char **argv){
       seq[t]=s; }
     fprintf(stderr,"[init] sequences ready\n");
 
+    // per-thread padded ops counters (plain stores, own cache line: ~free)
+    static struct { unsigned long v; char pad[56]; } op_count[257];   // one line per thread
+    static volatile int probe_run = 0;
+    int probe = getenv("XTIER_OPS_PROBE") && atoi(getenv("XTIER_OPS_PROBE"));
+    pthread_t probe_tid;
+    if (probe) { probe_run = 1; pthread_create(&probe_tid, NULL, ops_probe_main, (void*)op_count); }
+
     uint64_t ops_per_trial = mops*1000000ULL/trials;
     double total=0;
     for (int tr=0; tr<trials; tr++){
@@ -89,6 +110,7 @@ int main(int argc, char **argv){
           uint64_t seed = 0xabcdef + t + 31337*tr, v = 0;
           uint32_t *s = seq[t];
           for (uint64_t i=0;i<ops_per_trial;i++){
+              op_count[t].v++;
               // v feeds the index (always-zero term) => ops are serialized
               uint32_t blk = s[(i + (v&1)) & (SEQLEN-1)];
               uint32_t pgi = xr(&seed) % PPB;

@@ -94,3 +94,50 @@ numactl --cpunodebind=0 --membind=0 bench/zipf_chase 3 0.9 200 8 1 & sudo src/xt
 # 吞吐 A/B（exp6 脚本）
 /tmp/exp6.sh
 ```
+
+
+---
+
+## 补充（2026-11-23 深夜）：吞吐对照的曲折与最终修正
+
+exp6b（无补丁 MLP）暴露 **26K majflt/s 抖动螺旋**后，打了三个补丁（fault 回页钉住 /
+降级资格门槛 / fault 风暴滞后熄火）并改用单驱逐者架构（cgroup 3.2GB headroom +
+daemon 预算 2.5GB），加 ops 探针重跑（exp9）。过程中修了探针自身的假共享 bug
+（`_Alignas(64)` 只对齐数组头，8 线程共享计数行，contaminate 了 exp8）。
+
+### 最终数字（同夜同机，zipf_chase 3GB/θ0.9/8 线程/单轮，全 DRAM 参照 11.2s）
+
+| 配置 | 有效 DRAM | Trial Time | avg ops/s | majflt 总量 |
+|---|---|---|---|---|
+| 全 DRAM | 61 GB | 11.2 s | 21.4M | ~0 |
+| 内核 LRU @3.2GB | 3.2 GB | 66.8 s | 3.62M | — |
+| **MLP daemon（cgroup 3.2GB，预算 2.5GB 未执行到位）** | **3.19 GB** | **77.6 s** | 3.11M | 216,177 |
+| 内核 LRU @2.9GB | 2.9 GB | 283.8 s | 847K | — |
+| 无补丁 MLP（exp6b，cgroup 2.9GB） | ~2.87 GB | 749.8 s | ~320K | 5.61M |
+| 补丁后 MLP（exp7，cgroup 2.9GB，风暴门锁死） | 2.87 GB | 未完成(486s 终止) | — | 4.67M |
+| 内核 LRU @2.5GB | 2.5 GB | 1559.1 s | 154K | — |
+
+### 结论修正（推翻本报告早前 2.4× 的外推）
+
+1. **exp9 的"20×"是内存混淆**：MLP 组驻留 3.19GB（钉 cgroup 上限）vs LRU 组 2.5GB。
+   同内存对照 LRU@3.2GB=66.8s ⇒ **同等内存下 daemon 是 ~16% 纯开销**
+   （SPE per-op 采样 + 65MB 降级 churn + 216K 回 fault）。
+2. **预算执行是真正的短板**：63 epoch 仅降 65MB。两个发现通道带宽都不够：
+   冷扫描按页 page_idle 查询（每页 2–3 syscall）在快负载下找不到 idle 页
+   （每页 ~0.25s 被摸一次，A 位恒 1）；ML 门槛在 2K samples/epoch 密度下把候选池砍空。
+   模型无罪，**候选发现是瓶颈**。
+3. 仍然成立的成果：exp5 同硬预算 fault 率 2.4×（4,890 vs 11,621/s）；三补丁防住
+   26K/s 螺旋（exp6b→exp7）；cgroup 硬限与 daemon 预算重合会使 daemon 失效（exp4）。
+4. 架构性教训：**采样式策略在"内存够→跑得快→采样稀→候选少→预算不执行"和
+   "内存紧→抖动深→采样塌→投毒"两个方向都被自己的信息通道卡死**。
+   xTier 在 PEBS freq 模式（采样率自稳定）+ CXL 驻留可采的条件下不遇此耦。
+   出路：预测性促升/预取（把需求 fault 异步化）、批量 pagemap 扫描替代逐页
+   page_idle、SPE interval 自适应。
+
+### 复现命令（exp9/10）
+
+```sh
+ssh root@192.168.90.7; /tmp/exp9.sh   # lru@2.5G vs mlp@cgroup3.2G
+/tmp/exp10.sh                          # lru@3.2G, lru@2.9G 括号对照
+```
+原始数据：`/var/tmp/xtier-results/exp{6_lru,7_mlp_fixed,9,10}_*/`。

@@ -103,6 +103,7 @@ struct xt_cfg {
     int       spe_interval;
     int       spe_stores;
     uint32_t  cold_scan_chunk;
+    uint32_t  storm_pswpin;     // fault-storm stand-down threshold (pswpin/s EWMA)
     uint32_t  scorer_id;        // 0 mlp, 1 freq, 2 recency, 3 ewma, 4 random (xTier ablation)
 };
 enum xt_scorer { XT_SCORER_MLP = 0, XT_SCORER_FREQ, XT_SCORER_RECENCY, XT_SCORER_EWMA, XT_SCORER_RANDOM };
@@ -144,6 +145,7 @@ struct exec_stats {
     uint64_t demote_att, demote_ok, demote_fail;
     uint64_t cold_found, cold_scanned, cold_passes;
     uint64_t majflt_cum, pswpin_cum, pswpout_cum;
+    uint64_t storm_epochs;
 };
 extern struct exec_stats XSTATS;
 #endif

@@ -184,3 +184,12 @@ daemon 实际只降了 9 万页），即受害者选择是 MLP+内核混合，2.
 对纯 LRU 的下界；两组 Trial 都未在 130s 内跑完 300 Mops（thrash 区），吞吐对比
 需更长运行窗口。另 exp4 第一轮（无 headroom）暴露的"cgroup 硬限先触发则
 daemon 失效"是部署该方案时的必要注意事项。
+
+
+### exp7–exp10（吞吐对照与修正，2026-11-23 深夜）
+- 三补丁（fault 钉住/资格门槛/风暴滞后熄火 16K→13.6K）+ 单驱逐者架构（cgroup 3.2GB
+  headroom）+ ops 探针（修掉探针假共享 bug）。
+- 最终同内存对照：LRU@3.2GB 66.8s vs MLP 77.6s（daemon ~16% 纯开销）；exp9 的 20×
+  是内存混淆（MLP 组驻留 3.19GB vs LRU 2.5GB）。预算执行仅 65MB/63epoch——候选
+  发现通道（page_idle 逐页查询 + 2K samples/epoch）是瓶颈，不是模型。
+- 详见根目录《xtier-arm-复现报告.md》补充一节。
