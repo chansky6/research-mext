@@ -213,6 +213,7 @@ daemon 失效"是部署该方案时的必要注意事项。
   观测盲区（冷页 fault 不可见）需 BPF kprobe do_swap_page 补完；θ=2.0 是
   SATA 上 MEXT 式交易成立的负载参数（尾部份额 0.07%）。
 
-- exp17（θ2.0 + kprobe）：do_swap_page 通道打通（RLIMIT_MEMLOCK 坑），
-  预取 -29% fault 率但 SATA 上被 I/O 排队吃回（净 -8%）；θ2.0 下内核 LRU
-  自达 67% 保持率——价值边界框定：尾部肥→ML 值 2.22×，尾部陡→内核免费。
+- exp17/18（θ2.0 + kprobe）：do_swap_page 通道打通（RLIMIT_MEMLOCK 坑），预取
+  -29% fault 率但 SATA 上被 I/O 排队吃回（净 -8%）；MLP 全功能 60% vs 内核 67%，
+  软预算首次执行到位（驻留 1.97GB，悬崖给了真冷尾）但 inferences=18（ML 无活干，
+  冷扫描挑大梁）。价值边界框定：尾部肥→ML 值 2.22×，尾部陡→内核免费。
