@@ -56,6 +56,7 @@ static void read_vmstat_cum(uint64_t *pswpin, uint64_t *pswpout) {
 static int pidfd = -1;
 static int pagemap_fd = -1;
 static int pageidle_fd = -1;
+static void pref_note_demoted(uint64_t page, uint32_t epoch);   // defined with the ledger below
 
 void exec_init(void) {
     if (G.storm_pswpin > 0) storm_threshold = G.storm_pswpin;
@@ -126,6 +127,7 @@ void exec_demote(uint64_t *addrs, uint32_t n) {
     for (long i = 0; i < done; i++) {
         struct pstate *st = pol_state_get(addrs[i], 0);
         if (st) { st->tier = 2; st->last_mig_epoch = ep; }
+        pref_note_demoted(addrs[i], ep);      // ledger: prefetch hands off recently-demoted regions
     }
 }
 
@@ -273,6 +275,36 @@ static volatile int pref_run;
 static uint32_t pref_bps = PFR_PAGES_PER_SEC;
 static uint32_t pref_pause = 24000;       // XTIER_PREF_PAUSE: pswpin/s spiral guard
 
+// ---- demotion/prefetch shared ledger (exp13: without it the two channels
+// ---- ping-ponged the same regions at 16MB/s each way; resident pinned at
+// ---- the cgroup limit, budget unenforced). Main thread writes, worker reads.
+static _Atomic uint32_t reg_dem_epoch[1024];   // last epoch a page in region was demoted
+static _Atomic uint32_t reg_score_epoch[1024]; // epoch of the freshest ML score in region
+static _Atomic uint32_t reg_score_val[1024];   // best raw score seen this epoch
+static _Atomic uint32_t g_epoch_mirror;        // worker-side view of cur_epoch
+static _Atomic uint32_t dem_ewma;              // demotion pages/s EWMA (net-flow guard)
+
+void pref_note_score(uint64_t page, int32_t raw, uint32_t epoch) {
+    uint32_t idx = (uint32_t)((page >> 21) & 1023);
+    if (raw <= 0) return;                       // only keep positive-benefit signals
+    uint32_t se = atomic_load(&reg_score_epoch[idx]);
+    if (se == epoch) {
+        // same epoch: keep the max atomically (benign race, both positive)
+        uint32_t v = atomic_load(&reg_score_val[idx]);
+        if ((uint32_t)raw > v) atomic_store(&reg_score_val[idx], (uint32_t)raw);
+    } else {
+        atomic_store(&reg_score_val[idx], (uint32_t)raw);
+        atomic_store(&reg_score_epoch[idx], epoch);
+    }
+}
+
+void pref_note_epoch(uint32_t epoch) { atomic_store(&g_epoch_mirror, epoch); }
+
+static void pref_note_demoted(uint64_t page, uint32_t epoch) {
+    uint32_t idx = (uint32_t)((page >> 21) & 1023);
+    atomic_store(&reg_dem_epoch[idx], epoch);
+}
+
 void pref_note_fault(uint64_t page) {
     uint64_t region = page & REG_MASK_;
     uint32_t slot = (uint32_t)((region >> 21) & 1023);
@@ -310,6 +342,25 @@ static void *pref_worker(void *arg) {
 
         uint64_t region = pfr_req[t & (PFR_RING - 1)];
         atomic_store(&pfr_req_t, t + 1);
+
+        // --- suppression rule 1: region demotion cooldown ---
+        // The fault that queued this region usually fired on a page the daemon
+        // itself demoted earlier; without the ledger, prefetch re-imported the
+        // region's freshly-demoted neighbors (exp13 ping-pong, 16MB/s circular).
+        uint32_t ep = atomic_load(&g_epoch_mirror);
+        uint32_t idx = (uint32_t)((region >> 21) & 1023);
+        uint32_t d = atomic_load(&reg_dem_epoch[idx]);
+        if (d != 0 && ep >= d && ep - d < G.cooldown_epochs) continue;
+        // --- suppression rule 2: ML admission ---
+        // Only regions with a fresh (<=2 epochs) positive-benefit score get
+        // prefetch; cold or unscored regions stay out.
+        uint32_t se = atomic_load(&reg_score_epoch[idx]);
+        if (se == 0 || ep < se || ep - se > 2) continue;
+        if ((int32_t)atomic_load(&reg_score_val[idx]) <= 0) continue;
+        // --- suppression rule 3: net-flow breaker ---
+        // If swap-in runs at ~2x+ our own demotion rate, the two channels are
+        // cancelling: stand down until the ratio recovers.
+        if (storm_ewma_pswpin > 2ull * atomic_load(&dem_ewma) + 4096) { usleep(100000); continue; }
 
         ssize_t r = pread(pagemap_fd, pm, sizeof(pm), (off_t)(region / 4096 * 8));
         if (r <= 0) continue;
@@ -443,9 +494,9 @@ void exec_epoch(uint32_t ep_fin) {
     if (resident <= G.budget_pages) return;
 
     // Cold-scan demotion ALWAYS runs (hardware idle-bit evidence; now bulk).
-    static uint64_t cold_out[4096];
+    static uint64_t cold_out[16384];
     uint32_t n_cold = 0;
-    cold_scan_chunk(cold_out, 4096, &n_cold);
+    cold_scan_chunk(cold_out, 16384, &n_cold);
 
     uint64_t budget = G.mig_budget;
     if (n_cold > 0 && budget > 0) {
@@ -455,6 +506,13 @@ void exec_epoch(uint32_t ep_fin) {
             exec_demote(cold_out + off, m);
             budget -= m;
         }
+    }
+    {
+        // demotion rate EWMA for the net-flow guard (epoch cadence ~= 1s here)
+        static uint64_t dem_before;
+        uint32_t d = (uint32_t)(XSTATS.demote_ok - dem_before);
+        dem_before = XSTATS.demote_ok;
+        atomic_store(&dem_ewma, (uint32_t)(atomic_load(&dem_ewma) * 7 / 10 + d * 3 / 10));
     }
     if (storm_on) return;   // fault storm: only hardware-evidence demotion continues
     if (budget > 0) {

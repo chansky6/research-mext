@@ -142,6 +142,8 @@ uint32_t pol_dem_n(void);
 // exec.c
 void exec_init(void);
 void pref_note_fault(uint64_t page);
+void pref_note_score(uint64_t page, int32_t raw, uint32_t epoch);
+void pref_note_epoch(uint32_t epoch);
 void pref_start(void);
 void exec_epoch(uint32_t ep_fin);
 void exec_second(FILE *exec_csv);

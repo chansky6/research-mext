@@ -12,7 +12,7 @@ struct xt_cfg G = {
     .mode = 0, .epoch_ms = 250, .budget_pages = 0, .topk_admit_fraction = 0.15,
     .cooldown_epochs = COOLDOWN_EPOCHS, .thresh_dyn = 0, .out_zpC_cache = 0,
     .mig_budget = 2048, .state_bits = 22, .spe_interval = 4096, .spe_stores = 0,
-    .cold_scan_chunk = 50000,
+    .cold_scan_chunk = 200000,
 };
 
 static volatile int stop_flag;

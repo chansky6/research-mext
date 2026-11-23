@@ -390,6 +390,7 @@ void pol_process_epoch(uint32_t ep_fin, FILE *features_csv, FILE *stats_csv) {
             input[30] = mv->page_type; input[31] = mv->vma_size_bucket;
         }
         uint8_t cls_u8 = (uint8_t)mlp_forward_(input);
+        pref_note_score(page, (int32_t)cls_u8 - G.out_zpC_cache, ep_fin);   // region-level admission signal for prefetch
         // scorer ablation: same gates downstream, only the ranking changes
         if (G.scorer_id == XT_SCORER_FREQ) {
             uint32_t sum = row.hits;
@@ -451,7 +452,7 @@ void pol_process_epoch(uint32_t ep_fin, FILE *features_csv, FILE *stats_csv) {
     pol_epoch_cnt = 0;
 }
 
-void pol_next_epoch(void) { cur_epoch++; }
+void pol_next_epoch(void) { cur_epoch++; pref_note_epoch(cur_epoch); }
 uint32_t pol_cur_epoch(void) { return cur_epoch; }
 uint64_t pol_samples_rx(void) { return samples_rx; }
 uint64_t pol_inferences(void) { return inferences; }
