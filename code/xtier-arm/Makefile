@@ -9,8 +9,8 @@ BENCH = bench/zipf_chase bench/phase_zipf
 
 all: $(BIN) $(BENCH)
 
-src/xtierd: src/xtierd.c src/spe.c src/policy.c src/exec.c src/fault_ch.c src/xtierd.h $(MODEL_HDR) src/fault_kern.o
-	$(CC) $(CFLAGS) $(INC) -o $@ src/xtierd.c src/spe.c src/policy.c src/exec.c src/fault_ch.c -lbpf -lelf -lz -lm
+src/xtierd: src/xtierd.c src/spe.c src/policy.c src/model_if.c src/exec.c src/fault_ch.c src/xtierd.h src/model_if.h $(MODEL_HDR) src/fault_kern.o
+	$(CC) $(CFLAGS) $(INC) -o $@ src/xtierd.c src/spe.c src/policy.c src/model_if.c src/exec.c src/fault_ch.c -lbpf -lelf -lz -lm
 
 src/fault_kern.o: bpf/fault_kern.c
 	LLVM ?= /opt/homebrew/opt/llvm/bin

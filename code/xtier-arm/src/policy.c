@@ -7,6 +7,7 @@
  * rather than promotion; the math is unchanged.
  */
 #include "xtierd.h"
+#include "model_if.h"
 #include <time.h>
 #include <math.h>
 
@@ -80,8 +81,6 @@ static int check_heuristic_filter(struct feature_row *row, uint8_t cur_tier, uin
     return -1;
 }
 
-static struct dem_cand *dem_pool;
-static uint32_t dem_n;
 
 // ---- weights (us_build_weights) ----
 static struct row0 w_l0[L0_OUT]; static struct mul w_l0m[L0_OUT];
@@ -214,7 +213,6 @@ void pol_init(void) {
     state = calloc(state_slots, sizeof(struct pstate));
     meta_slots = 1u << 18;
     meta_tab = calloc(meta_slots, sizeof(struct meta_ent));
-    dem_pool = calloc(MAX_PAGES_PER_EPOCH, sizeof(struct dem_cand));
     if (!state || !meta_tab) { fprintf(stderr, "pol alloc failed\n"); exit(1); }
 
     qp = (struct qparams){ .in_zp0 = L0_IN_ZP[0], .out_zp0 = L0_OUT_ZP[0],
@@ -320,13 +318,31 @@ static uint32_t topk_threshold_from_hist(void) {
     return (uint32_t)dyn;
 }
 
-// ---- demotion candidate pool ----
+// ---- model input builder (exported for model_if backends) ----
 
-static int cand_cmp(const void *a, const void *b) {
-    const struct dem_cand *x = a, *y = b;
-    if (x->score != y->score) return x->score < y->score ? -1 : 1;
-    return x->last_seen < y->last_seen ? -1 : 1;
+// build the L0 input vector from a feature row (xTier us_build_input).
+// Exported so external model backends (model_if.h) see exactly the features
+// the training CSV schema promises.
+void pol_build_l0_input(const struct feature_row *row, uint8_t in[L0_IN]) {
+    memset(in, 64, L0_IN);
+    in[0] = (uint8_t)(row->epoch & 0xFF);
+    in[1] = log_scale(row->hits);
+    in[2] = log_scale(row->hits);
+    for (int h = 0; h < HIST_STEPS; h++) {
+        in[3 + h * 3 + 0] = log_scale(row->hits_prev[h]);
+        in[3 + h * 3 + 1] = log_scale(row->hits_prev[h]);
+        in[3 + h * 3 + 2] = pack_delta(row->delta_hits[h]);
+    }
+    in[21] = log_scale((uint32_t)row->recency_epochs);
+    in[22] = log_scale((uint32_t)row->epochs_since_promotion);
+    const struct meta_val *mv = pol_meta_get(row->page);
+    if (mv) {
+        in[23] = mv->anon; in[24] = mv->shared;
+        in[27] = mv->perm_r; in[28] = mv->perm_w; in[29] = mv->perm_x;
+        in[30] = mv->page_type; in[31] = mv->vma_size_bucket;
+    }
 }
+
 
 static void emit_feature_row_csv(FILE *csv, const struct feature_row *r) {
     if (!csv) return;
@@ -344,14 +360,14 @@ static void emit_feature_row_csv(FILE *csv, const struct feature_row *r) {
 }
 
 
-// ---- per-epoch decision pass (us_process_epoch, direction-flipped) ----
-// Score every touched page; build the demotion candidate pool from
-// low-scoring resident pages; top-K threshold from the score histogram.
+// ---- per-epoch decision pass (us_process_epoch port) ----
+// Score every touched page; the score's ONLY consumer is PROMOTION
+// (fault-candidate regions, exec.c promote_epoch). Demotion is scan-rule
+// driven (idle-bit cold scan); no ML pool anymore.
 void pol_process_epoch(uint32_t ep_fin, FILE *features_csv, FILE *stats_csv) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    dem_n = 0;
     uint32_t n_inf = 0;
     uint32_t n_keep = 0;
 
@@ -386,68 +402,22 @@ void pol_process_epoch(uint32_t ep_fin, FILE *features_csv, FILE *stats_csv) {
 
         int heuristic = check_heuristic_filter(&row, st->tier, G.cooldown_epochs);
         if (heuristic == -3) continue;   // cooldown
-        if (heuristic == 2 && st->tier == 1) {
-            // persistently cold resident page: demote candidate regardless of MLP
-            if (dem_pool) dem_pool[dem_n++] = (struct dem_cand){ .page = page, .score = -500, .last_seen = st->last_epoch_seen };
-            continue;
-        }
+        if (heuristic == 2) continue;   // persistently cold: idle-bit scan owns demotion now
         if (heuristic == 1) { st->last_score = 9999; st->last_inf_epoch = ep_fin; n_keep++; continue; } // persistently hot
 
-        uint8_t input[L0_IN];
-        memset(input, 64, sizeof(input));
-        input[0] = (uint8_t)(ep_fin & 0xFF);
-        input[1] = log_scale(row.hits);
-        input[2] = log_scale(row.hits);
-        for (int h = 0; h < HIST_STEPS; h++) {
-            input[3 + h * 3 + 0] = log_scale(row.hits_prev[h]);
-            input[3 + h * 3 + 1] = log_scale(row.hits_prev[h]);
-            input[3 + h * 3 + 2] = pack_delta(row.delta_hits[h]);
-        }
-        input[21] = log_scale((uint32_t)row.recency_epochs);
-        input[22] = log_scale((uint32_t)row.epochs_since_promotion);
-        if (mv) {
-            input[23] = mv->anon; input[24] = mv->shared;
-            input[27] = mv->perm_r; input[28] = mv->perm_w; input[29] = mv->perm_x;
-            input[30] = mv->page_type; input[31] = mv->vma_size_bucket;
-        }
-        uint8_t cls_u8 = (uint8_t)mlp_forward_(input);
-        pref_note_score(page, (int32_t)cls_u8 - G.out_zpC_cache, ep_fin);   // region-level admission signal for prefetch
-        // scorer ablation: same gates downstream, only the ranking changes
-        if (G.scorer_id == XT_SCORER_FREQ) {
-            uint32_t sum = row.hits;
-            for (int h = 0; h < HIST_STEPS; h++) sum += row.hits_prev[h];
-            cls_u8 = q255_log2(sum);
-        } else if (G.scorer_id == XT_SCORER_RECENCY) {
-            cls_u8 = (uint8_t)(255u - q255_log2((uint32_t)row.recency_epochs));
-        } else if (G.scorer_id == XT_SCORER_EWMA) {
-            uint32_t ew = row.hits << 5;
-            for (int h = 0; h < HIST_STEPS; h++) ew += row.hits_prev[h] << (4 - (h > 4 ? 4 : h));
-            cls_u8 = q255_log2(ew);
-        } else if (G.scorer_id == XT_SCORER_RANDOM) {
-            cls_u8 = (uint8_t)(prandom() & 0xFFu);
-        }
+        int32_t raw = 0;
+        if (model_if_score(&row, &raw) != 0) continue;
+        pref_note_score(page, raw, ep_fin);   // region-level promotion admission signal
         n_inf++;
-        hist[cls_u8]++;
-        int32_t raw = (int32_t)cls_u8 - G.out_zpC_cache;
+        {
+            int32_t cls = raw + G.out_zpC_cache;   // histogram in quantized space
+            if (cls < 0) cls = 0;
+            if (cls > 255) cls = 255;
+            hist[cls]++;
+        }
         st->last_score = raw;
         st->last_inf_epoch = ep_fin;
-        if (st->tier == 1) {
-            // resident: demotion candidate unless the score clears the top-K gate
-            uint32_t thresh = G.thresh_dyn > 0 ? G.thresh_dyn : 1;
-            // Fix 2 (demotion eligibility gate): require evidence across epochs.
-            // A single-epoch sighting under collapsed sampling is indistinguishable
-            // hot vs cold (exp6b: sample density fell 5x, every page looked
-            // "1 hit, cold", and the daemon re-demoted just-faulted hot pages).
-            // The heuristic-cold path (COLD_EPOCHS of zero hits) and the idle-bit
-            // cold scan keep their own stronger evidence and are unaffected.
-            int multi_epoch = (row.hits >= 2) || row.hits_prev[0] > 0 || row.hits_prev[1] > 0;
-            if (raw <= (int32_t)thresh && multi_epoch && dem_pool) {
-                if (dem_n < MAX_PAGES_PER_EPOCH)
-                    dem_pool[dem_n++] = (struct dem_cand){ .page = page, .score = raw, .last_seen = st->last_epoch_seen };
-            } else {
-                n_keep++;
-            }
-        }
+        n_keep++;
     }
     inferences += n_inf;
     epoch_inf = n_inf;
@@ -459,15 +429,14 @@ void pol_process_epoch(uint32_t ep_fin, FILE *features_csv, FILE *stats_csv) {
     }
     memset(hist, 0, sizeof(hist));
 
-    qsort(dem_pool, dem_n, sizeof(struct dem_cand), cand_cmp);   // lowest score first
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     uint64_t dur_ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull + (t1.tv_nsec - t0.tv_nsec);
-    printf("[EPOCH] ep=%u pages=%u inf=%u keep=%u dem_cands=%u thresh=%u proc_ms=%.2f\n",
-           ep_fin, pol_epoch_cnt, n_inf, n_keep, dem_n, G.thresh_dyn, dur_ns / 1e6);
+    printf("[EPOCH] ep=%u pages=%u inf=%u keep=%u thresh=%u model=%s proc_ms=%.2f\n",
+           ep_fin, pol_epoch_cnt, n_inf, n_keep, G.thresh_dyn, model_if_name(), dur_ns / 1e6);
     if (stats_csv) {
-        fprintf(stats_csv, "%u,%u,%u,%u,%u,%u,%.3f\n", ep_fin, pol_epoch_cnt, n_inf, n_keep,
-                dem_n, G.thresh_dyn, dur_ns / 1e6);
+        fprintf(stats_csv, "%u,%u,%u,%u,%u,%.3f\n", ep_fin, pol_epoch_cnt, n_inf, n_keep,
+                G.thresh_dyn, dur_ns / 1e6);
         fflush(stats_csv);
     }
     pol_epoch_cnt = 0;
@@ -485,6 +454,4 @@ struct pstate *pol_state_peek(uint32_t idx, uint64_t *page_out) {
     return e;
 }
 uint32_t pol_state_slots(void) { return state_slots; }
-struct dem_cand *pol_dem_pool(void) { return dem_pool; }
-uint32_t pol_dem_n(void) { return dem_n; }
 const struct meta_val *pol_meta_get(uint64_t page) { return meta_get(page); }

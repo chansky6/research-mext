@@ -31,28 +31,32 @@ xTier 的决策路径在内核（BPF perf_event 程序 + 内核模块调用 `xti
 | PEBS `MEM_UOPS_RETIRED.ALL_LOADS`，freq=2000/s | SPE per-task 事件，`load_filter=1`，`sample_period`=间隔（默认 4096 ops，环境变量 `XTIER_SPE_INTERVAL`） | 机器上有 `arm_spe_0`（type=19），min_interval=1024；per-task open 成功 |
 | BPF `on_pebs_stage0` 逐样本状态更新 | 用户态 `sample_cb`（`us_sample_cb` 移植），aux 逐记录解码 | 记录格式实测：48B/样本（b0+8B 指令VA、b2+8B 数据VA、62+4B events、49+1B op、65+4B context=tid、71+8B 时间戳） |
 | 内核 BPF 推理（tail-call MLP） | 用户态 INT8 MLP（`us_mlp_forward` 原样） | 与 xTier 用户态孪生相同 |
-| `xtier_migrate_range` 促升 (→node0) | 内核需求换页：访问已换出页自动 major fault 换入 | 见下"方向翻转" |
-| 内核模块迁移 (→node1) + PTE A-bit 冷扫描降级 | `process_madvise(pidfd, MADV_PAGEOUT)` + `page_idle` 位图冷扫描 | 实测 64MB MADV_PAGEOUT → present=0 swap=1；page_idle 存在；MADV_PAGEOUT 在 5.10 process_madvise 白名单内 |
+| `xtier_migrate_range` 促升 (→node0) | **模型驱动促升**：do_swap_page kprobe 标记 fault 候选 region → epoch 边界模型评分过 top-K 门 → worker 批量 `process_vm_readv` 回读 region 内仍换出的页（`promote_epoch`，exec.c） | 烟测：prom_cands=3171 region / 32.4 万页回读，端到端 |
+| 内核模块迁移 (→node1) + PTE A-bit 冷扫描降级 | **纯扫描降级**：`page_idle` 位图两轮判冷 + `process_madvise(MADV_PAGEOUT)`，不经任何模型 | exp20 教训落地：ML 池降级已删除 |
 | `move_pages` 1Hz tier 回读 | `/proc/pid/pagemap` present/swap 位回读 | 实测 pagemap 位正确反映换出/换入 |
 | node0 容量 = offline 内存块 | 预算 = RSS 目标，由 daemon 降级到预算线（无 cgroup 限制，内核不自主回收） | — |
 
-## 方向翻转（本移植最重要的语义决策）
+## 架构语义（v2，2026-11-24 重构：完全对齐 xTier 的促升/降级分工）
 
-xTier：内存**分配在慢层**（CXL），ML 预测"促升收益"，把热页搬上 DRAM；降级由
-PTE 冷扫描兜底。
+xTier 原文：**促升 = MLP**（PEBS 采样慢层 → 模型选热页 → 迁上 DRAM），
+**降级 = 扫描**（PTE A-bit 冷扫描/内核 LRU）。本项目 v1 曾因"swap 页不可采样"
+把 ML 挪到降级侧（分数 = 受害者排序）；exp20 暴露该设计的系统性风险后，
+重构回 xTier 原分工：
 
-DRAM+SSD 上方向必然倒转：内存**分配在快层**（DRAM），ML 分数语义不变
-（"未来 10 epoch 的再访问收益"），应用面反转：
-
-- **降级是主决策**：预算压力下按分数升序把低分常驻页 `MADV_PAGEOUT` 到 SSD。
-  分数高的页=模型预测会被再访问=留在 DRAM。促升侧不需要 ML：换出页被访问时
-  内核自动 major fault 换入（=隐式促升，成本即时可见）。
-- **换出页无法被采样**（SPE 只采驻留地址），所以"主动促升"没有增量信号——
-  预测性促升的正确位置就是降级决策本身（别把即将变热的页换出去）。
-  这是介质属性决定的（CXL 页驻留可采、swap 页不存在于地址空间），
-  不是实现捷径。冷却期（15 epoch）防换出-回fault抖动。
-- top-K 门：`histogram → cutoff → thresh` 数学逐行移植（`topk_threshold_from_hist`），
-  语义变为"DRAM 保留 top-K"。
+- **促升（模型驱动，全系统唯一的模型决策点）**：换出页的"访问证据"只有
+  fault 事件（do_swap_page kprobe）。fault 把页喂进特征管线（当轮被评分），
+  并把 2MB region 标记为候选；epoch 边界 `promote_epoch` 取该 region 最新
+  模型分数，过动态 top-K 门才入队，worker 批量回读 region 内仍换出的页
+  ——fault 页本身已被内核换入，**促升买到的是邻域**。
+- **降级（纯扫描规则）**：idle-bit 两轮判冷 + MADV_PAGEOUT；v1 的 ML 池
+  降级路径已删除。exp20 的教训（周期 sweep 负载让两轮 idle 证据系统性
+  假阳性）转为待办：给冷扫描候选加时间尺度复核，而非恢复 ML 池。
+- **模型可插拔（`src/model_if.h`）**：`feature_row`（与 features.csv 逐列同
+  schema）进 → 居中 int32 分数出。后端运行时选：
+  `XTIER_MODEL=none|mlp|freq|recency|ewma|random`（`none` = 桩：促升静默，
+  纯扫描基线）。接入自定义模型 = 实现一个函数 + 在 `model_if.c` 注册表
+  加一行。v1 的 top-K 门数学（`topk_threshold_from_hist`）原样保留，
+  语义变为促升准入门槛。
 
 ## 已知偏差（诚实清单）
 
@@ -71,13 +75,16 @@ DRAM+SSD 上方向必然倒转：内存**分配在快层**（DRAM），ML 分数
 ## 结构
 
 ```
-src/xtierd.c   主循环：epoch 驱动、模式（monitor/collect/evaluate/run）
-src/spe.c      SPE 采样器：per-task 事件 + aux 解码（GPL，参照 perf arm-spe 解码器）
-src/policy.c   状态表/特征/INT8 MLP/滤波/top-K（us_* 移植）
-src/exec.c     执行器：MADV_PAGEOUT、pagemap 回读、page_idle 冷扫描、预算
-ml/            训练管线（train_and_export.py 从 xTier 原样复制，Apache-2.0）
-bench/         zipf_chase / phase_zipf 负载（自 xTier 移植）+ 运行脚本
-env.sh         机器准备（sysctl/swap/THP）
+src/xtierd.c    主循环：epoch 驱动、模式（monitor/collect/evaluate/run）
+src/spe.c       SPE 采样器：per-task 事件 + aux 解码（GPL，参照 perf arm-spe 解码器）
+src/policy.c    状态表/特征/滤波/top-K（us_* 移植）+ 模型输入构建
+src/model_if.c  促升评分模型的可插拔接口与后端注册表（none/mlp/消融启发式）
+src/exec.c      执行器：促升门（promote_epoch）+ 预取 worker + MADV_PAGEOUT +
+               pagemap 回读 + page_idle 批量冷扫描 + 预算/风暴/账本守卫
+src/fault_ch.c  do_swap_page kprobe fault 通道（BPF，喂特征管线 + 促升候选）
+ml/             训练管线（train_and_export.py 从 xTier 原样复制，Apache-2.0）
+bench/          zipf_chase / phase_zipf / phase_xgb 负载（自 xTier 移植）+ 运行脚本
+env.sh          机器准备（sysctl/swap/THP）
 ```
 
 ## 用法
@@ -102,11 +109,17 @@ make MODEL_HDR=$PWD/ml/models/mlp_q8.h
 sudo XTIER_DRAM_BUDGET_MB=6000 src/xtierd <pid> 4096 250 run
 ```
 
-环境变量：`XTIER_SPE_INTERVAL`（默认 4096 ops）、`XTIER_SPE_STORES=1`、
+环境变量：`XTIER_MODEL`（促升评分后端：none/mlp/freq/recency/ewma/random，
+默认 mlp；旧名 `XTIER_SCORER` 仍作别名）、`XTIER_PREF_ML_GATE`（0=绕过模型
+门直接促升全部 fault 候选，A/B 用）、`XTIER_PREF_BPS`（预取页速预算，默认
+4096 页/s）、`XTIER_PREF_PAUSE`（风暴暂停阈值，默认 24000 pswpin/s）、
+`XTIER_SPE_INTERVAL`（默认 4096 ops）、`XTIER_SPE_STORES=1`、
 `XTIER_DRAM_BUDGET_MB`、`XTIER_TOPK_FRACTION`（默认 0.15）、
 `XTIER_COOLDOWN_EPOCHS`（默认 15）、`XTIER_MIG_BUDGET`（每 epoch 最大迁移页数，
 默认 2048）、`XTIER_COLD_SCAN_CHUNK`（默认 50000）、`XTIER_STATE_BITS`（默认 22）、
-`XTIER_FEATURES_CSV` / `XTIER_STATS_CSV`。
+`XTIER_FEATURES_CSV` / `XTIER_STATS_CSV` / `XTIER_EXEC_CSV`（列
+t_s,dmajflt_s,pswpin_s,pswpout_s,resident_pages,demote_ok,demote_fail,cold_found,
+majflt_cum,cold_scanned,pref_pages,pref_regions,prom_cands）。
 
 ## 训练目标（与 xTier 相同）
 
@@ -159,7 +172,7 @@ MLP 在更少的降级量下取得最少的回 fault：每次降级的回 fault 
 
 ### 后续工作
 - 把冷扫描产出纳入预算驱动，使驻留真正收敛到预算线；
-- XTIER_SCORER=recency/ewma 补全消融；
+- XTIER_MODEL=recency/ewma 补全促升门消融（v2：消融位置从降级池移到促升门）；
 - phase_zipf 相位变化实验（对应 xTier figures/plot_phase_response）；
 - 与内核 LRU（高 swappiness、无 ML）基线的 A/B：同一负载、无 xtierd 对照组。
 
@@ -222,3 +235,17 @@ daemon 失效"是部署该方案时的必要注意事项。
 - exp20（xgboost 相变 @2.5GB）：MLP -47%；新失败模式 = 周期 sweep 欺骗两轮 idle
   判冷（冷扫描通道无 ML 复核）。负载形态地图完成：集中→2.22×，陡崖→平，
   流式→平，sweep→负。bench/phase_xgb.py 为分块生成的移植版。
+
+### v2 重构（2026-11-24：促升=模型，降级=扫描，模型可插拔）
+- 动机：exp20（xgboost）暴露"ML 池降级"在周期 sweep 负载上系统性选错
+  受害者（-47%）；且 xTier 原文分工本来就是促升=MLP、降级=扫描。
+- 改动：`src/model_if.h/.c`（评分缝：feature_row 进 → 居中 int32 出；
+  后端 none/mlp/freq/recency/ewma/random 运行时切换，自定义模型加一行
+  注册即可）；fault 事件喂特征管线（fault_ch.c→pol_sample）；
+  `promote_epoch`（exec.c）= fault 候选 region × 新鲜模型分数 ≥ top-K
+  阈值 → 入队预取；ML 池降级路径整体删除（`pol_dem_pool`/`dem_cand`
+  已不存在）；worker 只剩降级冷却 + 净流量两道抑制。
+- 烟测（zipf_chase 2.4GB/θ0.9，预算 1.6GB，120s）：demote_ok=16384
+  （纯扫描），prom_cands=3171 region、pref_pages=324,621（促升链路全通），
+  [EPOCH] 带 `model=<backend>`。v2 后 stats.csv 去掉 `dem_cands` 列、
+  exec.csv 增 `prom_cands` 列（第 13 列）。

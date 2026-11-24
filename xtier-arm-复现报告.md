@@ -329,3 +329,50 @@ predswap ENV 已记录的同一坑）→ ringbuf → `pref_note_fault` → regio
 本移植的四个通道（采样 ML/冷扫描/kprobe 预取/账本守卫）在四种形态下各有失效
 与生效模式，全部记录在案。xgboost 的修复方向：冷扫描证据必须过 ML/时间尺度
 复核（扫过周期 ≥ 负载 sweep 周期，或冷候选带 ML 否决权）。
+
+## 架构重构 v2（2026-11-24：促升=模型，降级=扫描，模型可插拔）
+
+exp20 之后把系统重构回 xTier 原文的促升/降级分工，并留出模型接口：
+
+### v1 → v2 的决策依据
+- v1（ML 池降级）的两次实证失败：xgboost 周期 sweep 负载 -47%（idle 证据
+  系统性假阳性被 ML 排序放大）；且 v1 让模型承担了"选受害者"这个高风险
+  决策（选错付 150µs/页），而 xTier 原文里模型只承担"选促升"这个低风险
+  决策（选错只是提前换入一页，代价是带宽不是延迟）。
+- swap 页不可采样的问题用 fault 通道解决：do_swap_page kprobe = 换出页的
+  访问证据，v1 时代"促升无增量信号"的论断在 exp17 打通 kprobe 后已失效。
+
+### v2 数据流
+```
+fault(kprobe) ──┬─→ pol_sample（特征积累，当轮被评分）
+                └─→ region 候选表（2MB 槽，epoch 去重）
+epoch 边界: process_epoch 逐页评分 → pref_note_score(region 最佳分)
+            promote_epoch: fault 候选 ∧ 分数新鲜(≤2 epoch) ∧ ≥ top-K 阈值
+                           → 入队预取（worker 批量 process_vm_readv）
+降级: exec_epoch 纯 idle 两轮扫描 → MADV_PAGEOUT（无模型参与）
+```
+促升的语义：fault 页本身已被内核换入，**模型决策买到的是邻域**——
+"这个刚被拉回的 2MB 区值不值得整区批量回读"。
+
+### 模型接口（src/model_if.h）
+`feature_row`（与 features.csv 逐列同 schema）→ 居中 int32 分数。
+运行时 `XTIER_MODEL=none|mlp|freq|recency|ewma|random`；`none` 为桩
+（促升静默=纯扫描基线）。接入新模型 = 实现一个函数 + model_if.c 注册表
+加一行。top-K 门数学原样保留，语义从"DRAM 保留 top-K"变为"促升准入
+top-K"。
+
+### 烟测验证（zipf_chase 2.4GB/θ0.9，预算 1.6GB，cgroup 1.7GB，120s）
+- 降级纯扫描工作：demote_ok=16384（全部来自 cold_found）；
+- 促升链路全通：prom_cands=3171 region → pref_pages=324,621（~1.3GB
+  模型门放行的批量回读）；
+- [EPOCH] 现报 `model=<backend>`；exec.csv 新增第 13 列 prom_cands，
+  stats.csv 的 dem_cands 列已删除。
+- 烟测脚本坑：`timeout N ./bench &` 使 `$!` 捕获 timeout 的 pid 而非
+  负载 pid，daemon 会监视错进程（samples=0）；负载必须直跑后 kill。
+
+### v2 下的待验命题（下一步实验设计）
+1. 促升门消融：mlp vs none vs freq——fault 邻域回读的精度差异
+   （prom_cands 与回 fault 率的对照）；
+2. exp20 复测：纯扫描降级在 xgboost sweep 负载上是否仍 -47%
+   （v1 的锅在 ML 池还是扫描本身）；
+3. θ0.9 等预算对照复测（v2 架构 vs exp12 的 2.22×）。

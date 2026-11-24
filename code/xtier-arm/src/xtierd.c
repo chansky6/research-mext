@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <time.h>
 #include <unistd.h>
+#include "model_if.h"
 
 struct xt_cfg G = {
     .mode = 0, .epoch_ms = 250, .budget_pages = 0, .topk_admit_fraction = 0.15,
@@ -53,20 +54,10 @@ int main(int argc, char **argv) {
       if (e && *e) { int v = atoi(e); if (v >= 0) G.cooldown_epochs = (uint32_t)v; } }
     { const char *e = getenv("XTIER_STORM_PSWPIN");
       if (e && *e) { int v = atoi(e); if (v > 0) G.storm_pswpin = (uint32_t)v; } }
-    { const char *sc = getenv("XTIER_SCORER");
-      if (sc && *sc) {
-          static const char *names[] = { "mlp", "freq", "recency", "ewma", "random" };
-          int found = -1;
-          for (int i = 0; i < 5; i++) if (!strcmp(sc, names[i])) { found = i; break; }
-          if (found < 0) { fprintf(stderr, "[!] XTIER_SCORER='%s' unrecognized\n", sc); return 1; }
-          G.scorer_id = (uint32_t)found;
-      } }
     { const char *e = getenv("XTIER_DRAM_BUDGET_MB");
       if (e && *e) { uint64_t mb = strtoull(e, NULL, 10);
           G.budget_pages = mb * (1024 * 1024) / 4096; } }
 
-    { static const char *sn[] = { "mlp", "freq", "recency", "ewma", "random" };
-      printf("[*] scorer: %s (id=%u)\n", sn[G.scorer_id], G.scorer_id); }
     printf("[*] xtierd pid=%d mode=%s epoch_ms=%u interval=%d budget=%llu pages%s\n",
            (int)G.pid, m, G.epoch_ms, G.spe_interval,
            (unsigned long long)G.budget_pages,
@@ -82,13 +73,14 @@ int main(int argc, char **argv) {
     }
     { const char *p = getenv("XTIER_STATS_CSV");
       stats_csv = fopen(p ? p : "stats.csv", "w");
-      if (stats_csv) { fprintf(stats_csv, "epoch,pages,inferences,keep,dem_cands,thresh,proc_ms\n"); } }
+      if (stats_csv) { fprintf(stats_csv, "epoch,pages,inferences,keep,thresh,proc_ms\n"); } }
     { const char *p = getenv("XTIER_EXEC_CSV");
       exec_csv = fopen(p ? p : "exec.csv", "w");
-      if (exec_csv) { fprintf(exec_csv, "t_s,dmajflt_s,pswpin_s,pswpout_s,resident_pages,demote_ok,demote_fail,cold_found,majflt_cum,cold_scanned,pref_pages,pref_regions\n"); } }
+        if (exec_csv) fprintf(exec_csv, "t_s,dmajflt_s,pswpin_s,pswpout_s,resident_pages,demote_ok,demote_fail,cold_found,majflt_cum,cold_scanned,pref_pages,pref_regions,prom_cands\n"); }
 
     if (spe_init() != 0) return 1;
     pol_init();
+    if (model_if_init() != 0) return 1;
     exec_init();
     if (fault_ch_init(G.pid) != 0)
         fprintf(stderr, "[!] fault channel unavailable; prefetch degraded to sample-based\n");

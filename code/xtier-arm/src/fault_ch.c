@@ -27,14 +27,12 @@ static int fault_cb(void *ctx, void *data, size_t sz)
     (void)ctx;
     if (sz < sizeof(struct fault_ev)) return 0;
     const struct fault_ev *e = data;
-    struct pstate *st = pol_state_get(e->va, 0);
-    if (st) {
-        // fault-back observed for a tracked page: resident again + pin, so
-        // the demotion path leaves it alone for the cooldown window
-        st->tier = 1;
-        st->last_mig_epoch = pol_cur_epoch();
-    }
-    // region-level prefetch trigger (suppression rules live in the worker)
+    // the fault is an access the workload just paid for: feed it into the
+    // feature/epoch pipeline (pol_sample accumulates hits, flips tier 2->1,
+    // pins the cooldown) so the page is MODEL-SCORED in the same epoch.
+    pol_sample(NULL, e->va, 0);
+    // and mark the 2MB region as a promotion candidate; promote_epoch
+    // (exec.c) applies the model gate at the epoch boundary.
     pref_note_fault(e->va);
     return 0;
 }

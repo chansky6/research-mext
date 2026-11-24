@@ -240,7 +240,20 @@ static uint32_t cold_scan_chunk(uint64_t *out, uint32_t max_out, uint32_t *n_out
 }
 
 // =====================================================================
-// FAULT-NEIGHBORHOOD PREFETCH (predictive push-back, the MEXT analog)
+// MODEL-DRIVEN PROMOTION (xTier promote semantics, direction-flipped)
+//
+// xTier: PEBS samples the slow tier, the MLP picks the hot pages, they are
+// migrated up; demotion is scan/LRU. Our mirror on DRAM+SSD-swap:
+//   - a swap-in fault (kprobe do_swap_page) is the workload PULLING a
+//     swapped page back — that fault marks the 2MB region as candidate
+//     (fault_ch feeds the page into the feature/epoch pipeline too, so the
+//     page is scored in the same epoch);
+//   - at the epoch boundary the region's freshest model score is compared
+//     against the dynamic top-K threshold; regions that clear it get their
+//     still-swapped pages batched in by the prefetch worker below.
+//   - XTIER_PREF_ML_GATE=0 bypasses the model check (A/B ablation).
+// =====================================================================
+// ---- prefetch worker (the promotion actuator) ----
 //
 // A sample on a tier-2 page means the workload just paid a major fault for
 // it. Its 2MB region neighbors are statistically next (data locality), so
@@ -268,8 +281,9 @@ static uint64_t pfr_done[PFR_DONE];
 static _Atomic uint64_t pfr_done_h;              // producer cursor (worker)
 static _Atomic uint64_t pfr_done_t;              // consumer cursor (main)
 
-static uint64_t reg_seen[1024];                   // dedup: last region base per slot
-static uint32_t reg_epoch[1024];
+// fault-candidate regions (promotion decision input, promote_epoch)
+static uint64_t reg_fault_base[1024];              // last faulted region base per slot
+static uint32_t reg_fault_epoch[1024];             // epoch of the last fault in that region
 
 static volatile int pref_run;
 static uint32_t pref_bps = PFR_PAGES_PER_SEC;
@@ -307,15 +321,37 @@ static void pref_note_demoted(uint64_t page, uint32_t epoch) {
 }
 
 void pref_note_fault(uint64_t page) {
+    // mark the region as a promotion candidate; the model gate runs at the
+    // epoch boundary (promote_epoch). The fault itself already read the
+    // faulting page in — what promotion buys is the NEIGHBORHOOD.
     uint64_t region = page & REG_MASK_;
     uint32_t slot = (uint32_t)((region >> 21) & 1023);
     uint32_t ep = pol_cur_epoch();
-    if (reg_seen[slot] == region && reg_epoch[slot] == ep) return;  // already queued this epoch
-    reg_seen[slot] = region; reg_epoch[slot] = ep;
-    uint64_t h = atomic_load(&pfr_req_h);
-    if (h - atomic_load(&pfr_req_t) >= PFR_RING) return;             // full: drop
-    pfr_req[h & (PFR_RING - 1)] = region;
-    atomic_store(&pfr_req_h, h + 1);
+    if (reg_fault_base[slot] == region && reg_fault_epoch[slot] == ep) return;
+    reg_fault_base[slot] = region; reg_fault_epoch[slot] = ep;
+}
+
+// epoch-boundary promotion decision: fault-candidate region + fresh model
+// score above the top-K threshold -> enqueue for the prefetch worker
+static void promote_epoch(uint32_t ep) {
+    for (uint32_t i = 0; i < 1024; i++) {
+        uint64_t base = reg_fault_base[i];
+        if (!base) continue;
+        uint32_t fe = reg_fault_epoch[i];
+        if (fe == 0 || ep < fe || ep - fe > 2) continue;         // stale fault
+        if (pref_ml_gate) {
+            uint32_t se = atomic_load(&reg_score_epoch[i]);
+            if (se == 0 || ep < se || ep - se > 2) continue;     // no fresh model opinion
+            int32_t sc = (int32_t)atomic_load(&reg_score_val[i]);
+            uint32_t th = G.thresh_dyn > 0 ? G.thresh_dyn : 1;
+            if (sc < (int32_t)th) continue;                      // below top-K: not hot enough
+        }
+        uint64_t h = atomic_load(&pfr_req_h);
+        if (h - atomic_load(&pfr_req_t) >= PFR_RING) continue;   // ring full: drop
+        pfr_req[h & (PFR_RING - 1)] = base;
+        atomic_store(&pfr_req_h, h + 1);
+        XSTATS.prom_cands++;
+    }
 }
 
 static void *pref_worker(void *arg) {
@@ -352,15 +388,6 @@ static void *pref_worker(void *arg) {
         uint32_t idx = (uint32_t)((region >> 21) & 1023);
         uint32_t d = atomic_load(&reg_dem_epoch[idx]);
         if (d != 0 && ep >= d && ep - d < G.cooldown_epochs) continue;
-        // --- suppression rule 2: ML admission (XTIER_PREF_ML_GATE=0 to skip) ---
-        // Blocks unscored/negative regions. On cliff workloads (steep zipf) the
-        // pages that MOST deserve prefetch are cold-region first touches the
-        // model correctly scores cold, so the gate is per-workload.
-        if (pref_ml_gate) {
-            uint32_t se = atomic_load(&reg_score_epoch[idx]);
-            if (se == 0 || ep < se || ep - se > 2) continue;
-            if ((int32_t)atomic_load(&reg_score_val[idx]) <= 0) continue;
-        }
         // --- suppression rule 3: net-flow breaker ---
         // If swap-in runs at ~2x+ our own demotion rate, the two channels are
         // cancelling: stand down until the ratio recovers. Inactive when we
@@ -473,12 +500,13 @@ void exec_second(FILE *stats_csv) {
     last_majflt = XSTATS.majflt_cum; last_pswpin = pi; last_pswpout = po;
     if (stats_csv) {
         struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-        fprintf(stats_csv, "%ld.3,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+        fprintf(stats_csv, "%ld.3,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
                 ts.tv_sec, (unsigned long long)dmaj, (unsigned long long)dsi, (unsigned long long)dso,
                 (unsigned long long)exec_resident_pages(), (unsigned long long)XSTATS.demote_ok,
                 (unsigned long long)XSTATS.demote_fail, (unsigned long long)XSTATS.cold_found,
                 (unsigned long long)XSTATS.majflt_cum, (unsigned long long)XSTATS.cold_scanned,
-                (unsigned long long)XSTATS.pref_pages, (unsigned long long)XSTATS.pref_regions);
+                (unsigned long long)XSTATS.pref_pages, (unsigned long long)XSTATS.pref_regions,
+                (unsigned long long)XSTATS.prom_cands);
         fflush(stats_csv);
     }
 }
@@ -487,6 +515,7 @@ void exec_second(FILE *stats_csv) {
 void exec_epoch(uint32_t ep_fin) {
     if (G.mode != 3) return;
     pref_drain();
+    promote_epoch(ep_fin);   // model-driven promotion, before budget logic
     if (G.budget_pages == 0) return;
 
     // Fault-storm stand-down with hysteresis (16K on / 13.6K off): the gate
@@ -542,23 +571,6 @@ void exec_epoch(uint32_t ep_fin) {
         dem_before = XSTATS.demote_ok;
         atomic_store(&dem_ewma, (uint32_t)(atomic_load(&dem_ewma) * 7 / 10 + d * 3 / 10));
     }
-    if (storm_on) return;   // fault storm: only hardware-evidence demotion continues
-    if (budget > 0) {
-        // take the lowest-scored ML candidates, in 1024-page chunks
-        struct dem_cand *pool = pol_dem_pool();
-        uint32_t pn = pol_dem_n();
-        if (pool && pn > 0) {
-            static uint64_t addrs[1024];
-            uint32_t i = 0;
-            while (i < pn && budget > 0) {
-                uint32_t n = 0;
-                while (i < pn && n < 1024 && budget > 0) {
-                    addrs[n++] = pool[i++].page;
-                    budget--;
-                }
-                exec_demote(addrs, n);
-            }
-        }
-    }
     (void)ep_fin;
+    (void)storm_on;
 }

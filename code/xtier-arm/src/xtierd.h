@@ -104,9 +104,7 @@ struct xt_cfg {
     int       spe_stores;
     uint32_t  cold_scan_chunk;
     uint32_t  storm_pswpin;     // fault-storm stand-down threshold (pswpin/s EWMA)
-    uint32_t  scorer_id;        // 0 mlp, 1 freq, 2 recency, 3 ewma, 4 random (xTier ablation)
 };
-enum xt_scorer { XT_SCORER_MLP = 0, XT_SCORER_FREQ, XT_SCORER_RECENCY, XT_SCORER_EWMA, XT_SCORER_RANDOM };
 extern struct xt_cfg G;
 
 // spe.c
@@ -138,14 +136,13 @@ void spe_set_interval(uint64_t period);
 int fault_ch_init(pid_t pid);
 void fault_ch_poll(void);
 
-// policy demotion pool
-struct dem_cand { uint64_t page; int32_t score; uint32_t last_seen; };
-struct dem_cand *pol_dem_pool(void);
-uint32_t pol_dem_n(void);
+// promotion model seam: see model_if.h (the only model decision in the
+// loop is promotion; demotion is scan-rule driven, exec.c)
 
 // exec.c
 void exec_init(void);
 void pref_note_fault(uint64_t page);
+void pol_build_l0_input(const struct feature_row *row, uint8_t in[L0_IN]);
 void pref_note_score(uint64_t page, int32_t raw, uint32_t epoch);
 void pref_note_epoch(uint32_t epoch);
 uint32_t pol_rb_take(uint64_t *out, uint32_t max);
@@ -160,6 +157,7 @@ struct exec_stats {
     uint64_t storm_epochs;
     uint64_t pref_pages, pref_regions;
     uint64_t rb_flips;
+    uint64_t prom_cands;        // regions enqueued for model-driven promotion
 };
 extern struct exec_stats XSTATS;
 #endif
