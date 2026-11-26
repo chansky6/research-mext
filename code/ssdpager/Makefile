@@ -1,7 +1,7 @@
 obj-m := ssdpager.o
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
-all: modules sptest
+all: modules sptest spd
 
 modules:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
@@ -9,6 +9,9 @@ modules:
 sptest: sptest.c ssdpager.h
 	$(CC) -O2 -Wall -o $@ sptest.c -lpthread
 
+spd: spd.c ssdpager.h
+	$(CC) -O2 -Wall -o $@ spd.c -lpthread
+
 clean:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
-	rm -f sptest
+	rm -f sptest spd

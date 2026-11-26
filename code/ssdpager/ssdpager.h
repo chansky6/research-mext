@@ -78,4 +78,22 @@ struct sp_trace {
 
 #define SP_TRACE	_IOWR('S', 7, struct sp_trace)
 
+/*
+ * State of every page in [addr, addr+len) of process pid, one byte per page
+ * (len <= 1 GiB).  With SP_SCAN_CLEAR the access flag of the private anonymous
+ * pages reported as SP_PG_YOUNG is cleared, so the next scan tells which pages
+ * were touched in between.
+ */
+#define SP_SCAN_CLEAR	1
+
+struct sp_scan {
+	__s32 pid;
+	__u32 flags;
+	__u64 addr;
+	__u64 len;
+	__u64 states;
+};
+
+#define SP_SCAN		_IOW('S', 8, struct sp_scan)
+
 #endif

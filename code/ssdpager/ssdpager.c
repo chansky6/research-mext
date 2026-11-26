@@ -44,6 +44,8 @@
 #define SP_FAULT_TRIES	64
 #define SP_HIST		24
 #define SP_VEC_MAX	(1U << 16)
+#define SP_SCAN_MAX	(1UL << 18)		/* pages per SP_SCAN */
+#define SP_SCAN_STEP	(32UL << 20)		/* bytes per mmap_lock hold */
 #define SP_TRACE_SIZE	(1U << 16)		/* events, power of two */
 #define SP_TRACE_READ	4096U
 
@@ -904,20 +906,29 @@ out:
 
 /* ---- page state query ------------------------------------------------- */
 
+struct sp_walk {
+	u8 *st;			/* one byte per page from base */
+	unsigned long base;
+	bool clear;		/* take the access flag off what we report */
+};
+
 /* Huge and non-present PMDs are answered here so the walker never splits. */
 static int sp_q_pmd(pmd_t *pmd, unsigned long addr, unsigned long next,
 		    struct mm_walk *walk)
 {
 	pmd_t v = pmdp_get_lockless(pmd);
-	u8 *st = walk->private;
+	struct sp_walk *w = walk->private;
+	u8 st;
 
-	if (!pmd_present(v)) {
-		*st = pmd_none(v) ? SP_PG_NONE : SP_PG_BUSY;
-		walk->action = ACTION_CONTINUE;
-	} else if (pmd_leaf(v)) {
-		*st = pmd_young(v) ? SP_PG_YOUNG : SP_PG_OLD;
-		walk->action = ACTION_CONTINUE;
-	}
+	if (!pmd_present(v))
+		st = pmd_none(v) ? SP_PG_NONE : SP_PG_BUSY;
+	else if (pmd_leaf(v))
+		st = pmd_young(v) ? SP_PG_YOUNG : SP_PG_OLD;
+	else
+		return 0;
+	memset(w->st + ((addr - w->base) >> PAGE_SHIFT), st,
+	       (next - addr) >> PAGE_SHIFT);
+	walk->action = ACTION_CONTINUE;
 	return 0;
 }
 
@@ -925,12 +936,26 @@ static int sp_q_pte(pte_t *pte, unsigned long addr, unsigned long next,
 		    struct mm_walk *walk)
 {
 	pte_t v = ptep_get(pte);
-	u8 *st = walk->private;
+	struct sp_walk *w = walk->private;
+	u8 *st = w->st + ((addr - w->base) >> PAGE_SHIFT);
 
 	if (pte_none(v)) {
 		*st = SP_PG_NONE;
 	} else if (pte_present(v)) {
 		*st = pte_young(v) ? SP_PG_YOUNG : SP_PG_OLD;
+		/*
+		 * Only where we could evict.  The TLB must forget the flag too
+		 * or a hot page stays "old"; flush_tlb_page_nosync() needs an
+		 * unexported mmu-notifier symbol, so issue its TLBI here.
+		 */
+		if (w->clear && pte_young(v) && sp_vma_ok(walk->vma, true) &&
+		    vma_is_anonymous(walk->vma) &&
+		    ptep_test_and_clear_young(walk->vma, addr, pte)) {
+			unsigned long ta = __TLBI_VADDR(addr, ASID(walk->mm));
+
+			__tlbi(vale1is, ta);
+			__tlbi_user(vale1is, ta);
+		}
 	} else {
 		swp_entry_t e = pte_to_swp_entry(v);
 
@@ -977,9 +1002,10 @@ static long sp_do_query(struct sp_query *q)
 		}
 		for (; i < stop; i++) {
 			unsigned long a = addrs[i] & PAGE_MASK;
+			struct sp_walk w = { .st = &st[i], .base = a };
 
 			/* unmapped address: stays SP_PG_NONE */
-			walk_page_range(mm, a, a + PAGE_SIZE, &sp_q_ops, &st[i]);
+			walk_page_range(mm, a, a + PAGE_SIZE, &sp_q_ops, &w);
 		}
 		mmap_read_unlock(mm);
 		cond_resched();
@@ -991,6 +1017,45 @@ out:
 	if (mm)
 		mmput(mm);
 	kvfree(addrs);
+	return ret;
+}
+
+/* State of every page of a range, optionally ageing it: the cold-page scan. */
+static long sp_do_scan(struct sp_scan *s)
+{
+	unsigned long addr = s->addr & PAGE_MASK, end = addr + s->len;
+	struct sp_walk w = { .base = addr, .clear = s->flags & SP_SCAN_CLEAR };
+	struct mm_struct *mm;
+	long ret = 0;
+
+	if (end <= addr || (end - addr) >> PAGE_SHIFT > SP_SCAN_MAX ||
+	    (s->flags & ~SP_SCAN_CLEAR))
+		return -EINVAL;
+	mm = sp_get_mm(s->pid);
+	if (!mm)
+		return -ESRCH;
+	w.st = kvzalloc((end - addr) >> PAGE_SHIFT, GFP_KERNEL);
+	if (!w.st) {
+		mmput(mm);
+		return -ENOMEM;
+	}
+	while (addr < end) {
+		unsigned long next = min(end, addr + SP_SCAN_STEP);
+
+		if (mmap_read_lock_killable(mm)) {
+			ret = -EINTR;
+			break;
+		}
+		walk_page_range(mm, addr, next, &sp_q_ops, &w);
+		mmap_read_unlock(mm);
+		addr = next;
+		cond_resched();
+	}
+	if (!ret && copy_to_user(u64_to_user_ptr(s->states), w.st,
+				 (end - w.base) >> PAGE_SHIFT))
+		ret = -EFAULT;
+	kvfree(w.st);
+	mmput(mm);
 	return ret;
 }
 
@@ -1024,6 +1089,7 @@ static long sp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		struct sp_vec v;
 		struct sp_query q;
 		struct sp_trace t;
+		struct sp_scan s;
 	} u;
 	long ret;
 
@@ -1046,6 +1112,8 @@ static long sp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 	case SP_QUERY:
 		return sp_do_query(&u.q);
+	case SP_SCAN:
+		return sp_do_scan(&u.s);
 	case SP_TRACE:
 		ret = sp_do_trace(&u.t);
 		break;

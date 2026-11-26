@@ -359,6 +359,38 @@ khugepaged 会对非 present PTE 调 `do_swap_page`（`mm/khugepaged.c:1009-1015
 - `t_trace` 的判定放宽为：读过的 512 页必须全部是 `YOUNG`（不许漏计），命中 + 浪费 = 1024，多计不超过 4 页并逐页打印。**这是放宽断言，不是修复**；观测到的多计频率约为每 200 次运行 1–2 页（每次 512 个未读预取页）。
 - **daemon 的口径**：`YOUNG` 计出的命中数是上界。(1) 的偏差取决于负载的分支行为（数据相关的循环退出、指针追逐偏差大），无法从模块侧消除；(2)(3) 量级在万分之一以下，但成因未明。需要精确命中时只能用缺页轨迹反推，本轮未做。
 
+### 5.11 V8 daemon 最小闭环（`spd` + memcached）
+
+2026-11-26。新增 `code/ssdpager/spd.c`（独立守护进程，按 pid 管一个进程）与模块接口 `SP_SCAN`。
+
+**机制**：
+
+- **冷页扫描**：`SP_SCAN {pid, addr, len, flags}`（`ssdpager.c` `sp_do_scan`）一次返回区间内每页状态（上限 1 GiB，每 32 MiB 重取一次 `mmap` 读锁）；带 `SP_SCAN_CLEAR` 时清掉私有匿名页的访问位。清位后必须让 TLB 失效，否则热页会一直显示"未访问"；`flush_tlb_page_nosync()` 依赖未导出符号 `__mmu_notifier_arch_invalidate_secondary_tlbs`（modpost 报 undefined），模块改为自己发 `TLBI VALE1IS`（`sp_q_pte`）。
+- **换出线程**：每 1 s 扫一遍 `/proc/<pid>/maps` 里 `rw-p` 匿名区，页龄 = 连续未访问的扫描次数；驻留超出预算时按页龄从老到新选页，`SP_EVICTV` 换出，限速 20000 页/s，页龄 0 的页不换。
+- **预取线程**：轮询 `SP_TRACE`（空闲时 200 µs 一次），对每个缺页事件问预测器，候选先 `SP_QUERY` 过滤出在 SSD 上的，再 `SP_PROMOTEV`（截止 5 ms，每批 ≤256 页）。预测器：`none`（纯被动）、`next`（缺页地址后 8 页）、`markov`（上次紧随其后缺页的页，沿链最多 8 步，每页记 2 个后继）、`both`。
+- **命中记账**：预取成功的页（调用后再 `SP_QUERY` 确认在 DRAM）打标；之后扫描见到已访问记命中，连续 2 次扫描未访问或被再次换出记浪费。命中是上界（§5.10）。
+
+**实验**（`bench/mc_spd.sh`，负载同 predswap 的 `mc_slo.sh`）：memcached 1.6.12 `-m 3072 -t 4`，绑 NUMA 节点 0；1,000,000 键 × 2000 B，装载后匿名驻留约 2228 MiB；`swapoff -a`、THP never；daemon 预算 1200 MiB，启动后静置 90 s；再跑固定 2,000,000 次操作（Zipf s=1.0，GET:SET=95:5，8 连接深度 1）。每个变体重启 memcached，各跑 1 次。
+
+| 变体 | 吞吐 ops/s | p50 µs | p99 µs | p99.9 µs | 稳态缺页 | 预取页 | 命中 | 浪费 | 换出页 | 结束时 SSD MiB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| B0（全在 DRAM，无 daemon） | 115173 | 65 | 106 | 167 | 0 | – | – | – | – | 0 |
+| none | 22548 | 66 | 1199 | 62987 | 497282 | 0 | – | – | 1038226 | 1016 |
+| next | 17519 | 67 | 4163 | 49043 | 414953 | 1071812 | 84911 | 974759 | 1985646 | 974 |
+| markov | 17865 | 67 | 2198 | 62357 | 471176 | 300341 | 38795 | 251833 | 1318858 | 1008 |
+| both | 9321 | 68 | 21299 | 67662 | 426136 | 1391307 | 80701 | 1299755 | 2343894 | 980 |
+
+（预取页/命中/浪费/换出页为 daemon 全程累计，含静置期；稳态缺页为模块 `fault` 计数在稳态段的增量。err 全为 0，dmesg 无 WARN/BUG，全程 qaxsafed `read_bytes` 增量 0。）
+
+结论：
+
+- **闭环成立**：扫描 → 选冷 → 换出 → 缺页轨迹 → 预取 → 记账全部跑通；约 1 GiB（45%）数据留在 SSD，0 错误。扫描 2.2 GiB 一遍 15-30 ms。
+- **这个预算下代价很大**：纯被动吞吐为 B0 的 19.6%，p99 11 倍，p99.9 约 63 ms。
+- **两个简单预测器都是负收益**：命中率 `next` 7.9%（84911/1071812）、`markov` 12.9%（38795/300341）；缺页只少 5-17%，而浪费的预取页挤占预算、换出量翻倍（`next` 1.99M 对 `none` 1.04M），吞吐反降 21-22%，`both` 降 59%。Zipf 随机键访问下地址相邻与一阶后继都没有可用的规律。
+- **静置期也在抖动**：没有客户端请求时，`none` 仍以约 7100 次/s 缺页、约 7200 页/s 换出（日志 t=87-90 s）。推断是 memcached 后台线程（LRU 维护/爬虫）在遍历条目，未验证。因此"静置后页龄大的页就是冷页"在 memcached 上不成立，1200 MiB 预算一直处于抖动状态。
+
+未做：每变体只跑 1 次，无方差；未扫预算（找不抖动的最小 DRAM）；未关 memcached 后台爬虫做对照；`spd` 只管单个 pid；未与原生 swap 同预算对比。
+
 ## 6. 环境干扰与注意事项
 
 ### 6.1 qaxsafed 扫描页面存储文件
@@ -396,6 +428,8 @@ insmod ssdpager.ko dev=$LOOP
 ./sptest rate; ./sptest rate rev        # V6：预取吞吐（升序 / 降序 LBA）+ 散页批量
 ./sptest slots 1024; ./sptest vec; ./sptest trace   # V7：槽位连续度 / 离散页批量 / 轨迹与记账
 ./sptest victim 1024 &                 # 外部进程：evict PID / promote PID / evacuate / stat
+./spd -p PID -b 1200 -P none           # V8：daemon（-P none|next|markov|both）
+sh bench/mc_spd.sh B0:0 none:1200 next:1200 markov:1200 both:1200   # 需 mcbench（code/predswap/bench/mcbench.c，gcc -O2 -lm -lpthread）
 ```
 
 ## 8. 未做与下一步
@@ -404,7 +438,7 @@ insmod ssdpager.ko dev=$LOOP
 
 1. **文件页与 shmem**：路线 A 在源码层面就不支持，需要另选通路。
 2. **内存压力下的兜底**：shrinker / OOM notifier 驱动的换出；没有它，daemon 跟不上时系统会直接 OOM。
-3. **冷页选择、预测模型、迁移带宽与水位控制**（daemon）。
+3. **daemon**：最小闭环已做（§5.11），简单预测器在 memcached 上为负收益；预测模型、预算扫描、多进程与全局水位未做。
 4. **`MemTotal` 可感知扩容**（目标 9）。
 5. **memcg**：换出后页是否仍计入 cgroup 限额，未测。
 6. **规模**：最大只测到 1 GiB 换出、单进程 512 MiB 压力；多进程并发、数十 GiB 规模、槽位位图锁竞争未测。
