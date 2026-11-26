@@ -47,10 +47,12 @@ for spec do
 	numactl --cpunodebind=0 --membind=0 memcached -u root -l 127.0.0.1 -p "$port" -m "${MC_MEM:-3072}" -t 4 -c 4096 ${MC_OPTS:-} &
 	memc=$!
 	sleep 1
+	if [ -z "${DAEMON_EARLY:-}" ]; then
 	if [ -n "${TRACE:-}" ]; then
 		"$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" 0 "$WARM" > "$out/$variant-$budget.preload"
 	else
 		"$here/mcbench" preload 127.0.0.1 "$port" "$threads" "$keys" "$value" 0 "$zipf" 95 > "$out/$variant-$budget.preload"
+	fi
 	fi
 	if [ "$variant" = oracle ]; then
 		# every key's item address, taken before anything is evicted
@@ -65,11 +67,15 @@ for spec do
 		"$here/spd" -p "$memc" -b "$budget" -P "$variant" ${SPD_OPTS:-} > "$out/$variant-$budget.spd" &
 		d=$!
 	fi
+	if [ -n "${DAEMON_EARLY:-}" ] && [ -n "${TRACE:-}" ]; then
+		# the daemon runs while the cache fills, so its page ages come from real traffic
+		"$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" 0 "$WARM" > "$out/$variant-$budget.preload"
+	fi
 	if [ -n "$d" ]; then
 		# let the daemon reach the budget while the keyspace is idle
-		sleep "$((settle - 10))"
+		[ "$((settle - 10))" -le 0 ] || sleep "$((settle - 10))"
 		fi=$(stat fault)
-		sleep 10
+		[ "$settle" -le 0 ] || sleep 10
 		idle=$((($(stat fault) - fi) / 10))
 	fi
 	f0=$(stat fault)
