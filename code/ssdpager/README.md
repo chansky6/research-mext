@@ -35,7 +35,9 @@ SPD_OPTS="-F /tmp/faults.bin" PATTERN=run:64 sh bench/mc_spd.sh oracle:1200   # 
 # 真实 trace 回放：Twitter cache-trace（bench/twprep.py 转换，bench/mctrace.c 回放）
 zstd -dc cluster52.sort.zst | head -n 40000000 | bench/twprep.py c52.bin   # 输出统计 + 12 字节/条的回放文件
 TRACE=c52.bin WARM=20000000 OPS=2000000 SETTLE=180 MC_OPTS="-o no_lru_crawler" sh bench/mc_spd.sh B0:0 none:600 stream:600
-#   WARM 条填充缓存后才启动 daemon，之后 OPS 条计入测量；QPS=n 按 n 请求/s 开环发送（默认闭环保底）
+#   WARM 条填充缓存后才启动 daemon，测量 [SKIP, SKIP+OPS)（SKIP 默认等于 WARM）；
+#   WARM 超过 trace 长度可先建满整个 keyspace，测量窗口就没有冷启动；QPS=n 开环发送（默认闭环）
+bench/mctrace map PID KEYS MAP      # 每个 key 的条目地址（u64 addr, u32 nbytes, u32 ksize），用于页级分析
 #   MC_MEM 覆盖 memcached 的 -m（默认 3072）
 ./sptest evict PID; ./sptest promote PID; ./sptest evacuate; ./sptest stat
 ```

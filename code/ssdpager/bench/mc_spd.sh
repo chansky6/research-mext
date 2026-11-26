@@ -10,8 +10,10 @@
 # Variant oracle (needs PATTERN): the client tells spd which pages each request
 # LOOKAHEAD (default 256) requests ahead will touch.  SPD_OPTS adds spd options.
 # TRACE=FILE (from bench/twprep.py) replays a request trace with bench/mctrace
-# instead: records [0, WARM) fill the cache before the daemon starts, the next
-# OPS are measured, at QPS requests/s when QPS is set (else closed loop).
+# instead: records [0, WARM) fill the cache before the daemon starts, records
+# [SKIP, SKIP+OPS) are measured (SKIP defaults to WARM), at QPS requests/s when
+# QPS is set (else closed loop).  WARM past the end of the trace populates every
+# key the trace has, which makes the measured window free of cold starts.
 # MC_MEM (default 3072) is memcached's -m.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -72,7 +74,7 @@ for spec do
 	fi
 	f0=$(stat fault)
 	if [ -n "${TRACE:-}" ]; then
-		"$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" "$WARM" "$ops" "${QPS:-0}" > "$out/$variant-$budget.steady"
+		"$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" "${SKIP:-$WARM}" "$ops" "${QPS:-0}" > "$out/$variant-$budget.steady"
 	elif [ "$variant" = oracle ]; then
 		"$here/bench/mcloc" 127.0.0.1 "$port" "$threads" "$keys" "$value" "$ops" "$getpct" "$seed" "$PATTERN" \
 			"$out/map" "$out/hints" "${LOOKAHEAD:-256}" > "$out/$variant-$budget.steady"

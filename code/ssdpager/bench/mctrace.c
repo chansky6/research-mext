@@ -28,6 +28,13 @@
 #include <time.h>
 #include <unistd.h>
 
+#define PG		4096UL
+/* memcached 1.6 item header, same offsets as bench/mcloc.c uses */
+#define IT_NBYTES	32
+#define IT_FLAGS	38
+#define IT_NKEY		41
+#define IT_LINKED	1
+#define IT_CAS		2
 #define KEYMIN	10
 #define KEYMAX	250
 #define VALMAX	(1L << 20)
@@ -188,6 +195,122 @@ static int cmp_int(const void *x, const void *y)
 	return (*(const int *)x > *(const int *)y) - (*(const int *)x < *(const int *)y);
 }
 
+/* ---- map: every key's item address, for page-level analysis ---------------- */
+
+#define IT_PAD		48	/* key offset when the item carries no CAS field */
+#define SCAN_CHUNK	(4UL << 20)
+#define SCAN_CARRY	512UL
+
+struct addr {
+	uint64_t addr;
+	uint32_t nbytes;
+	uint32_t ksize;
+};
+
+/* Is the "k%09u"+"x"* at b[i] the key of a linked item of ours?  Returns the
+ * header length (48, or 56 with CAS), 0 when no; sets *k and *nk. */
+static unsigned int item_at(const unsigned char *b, size_t i, unsigned int *k, unsigned int *nk)
+{
+	unsigned int hdr, j;
+
+	for (*k = 0, j = 1; j < 10; j++) {
+		if (b[i + j] < '0' || b[i + j] > '9')
+			return 0;
+		*k = *k * 10 + b[i + j] - '0';
+	}
+	for (hdr = 48; hdr <= 56; hdr += 8) {
+		const unsigned char *it = b + i - hdr;
+		int32_t nbytes;
+		uint16_t flags;
+		unsigned int n;
+
+		if (i < hdr)
+			continue;
+		memcpy(&nbytes, it + IT_NBYTES, sizeof(nbytes));
+		memcpy(&flags, it + IT_FLAGS, sizeof(flags));
+		n = it[IT_NKEY];
+		if (n < 10 || n > KEYMAX || nbytes < 2 || nbytes > (int32_t)VALMAX + 2 ||
+		    !(flags & IT_LINKED) || !!(flags & IT_CAS) != (hdr == 56))
+			continue;
+		for (j = 10; j < n; j++)
+			if (b[i + j] != 'x')
+				break;
+		if (j < n)
+			continue;
+		*nk = n;
+		return hdr;
+	}
+	return 0;
+}
+
+static int do_map(int pid, unsigned long nkeys, const char *out)
+{
+	unsigned char *buf = malloc(SCAN_CARRY + SCAN_CHUNK);
+	char path[64], line[512];
+	struct addr *map = calloc(nkeys, sizeof(*map));
+	unsigned long cand = 0, bytes = 0;
+	unsigned long found = 0, dup = 0;
+	FILE *maps, *f;
+	int mem;
+
+	snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+	maps = fopen(path, "r");
+	snprintf(path, sizeof(path), "/proc/%d/mem", pid);
+	mem = open(path, O_RDONLY);
+	if (!buf || !map || !maps || mem < 0)
+		die("map");
+	while (fgets(line, sizeof(line), maps)) {
+		unsigned long s, e, ino, a;
+		char perm[8], name[256] = "";
+		size_t have = 0;
+
+		if (sscanf(line, "%lx-%lx %7s %*x %*s %lu %255s", &s, &e, perm, &ino, name) < 4)
+			continue;
+		if (strcmp(perm, "rw-p") || ino || (name[0] && strcmp(name, "[heap]")))
+			continue;
+		for (a = s; a < e; ) {
+			size_t want = e - a < SCAN_CHUNK ? e - a : SCAN_CHUNK, i;
+			ssize_t r = pread(mem, buf + have, want, a);
+
+			if (r <= 0) {
+				a += PG;
+				have = 0;
+				continue;
+			}
+			a += r;
+			have += r;
+			bytes += r;
+			for (i = 56; i + KEYMAX + 56 <= have; i++) {
+				unsigned int k, nk, hdr;
+				uint64_t at;
+
+				if (buf[i] != 'k')
+					continue;
+				cand++;
+				if (!(hdr = item_at(buf, i, &k, &nk)) || k >= nkeys)
+					continue;
+				at = a - have + i - hdr;
+				dup += map[k].addr && map[k].addr != at;
+				if (!map[k].addr) {
+					map[k].addr = at;
+					memcpy(&map[k].nbytes, buf + i - hdr + IT_NBYTES, 4);
+					map[k].ksize = nk;
+					found++;
+				}
+			}
+			if (have > SCAN_CARRY) {
+				memmove(buf, buf + have - SCAN_CARRY, SCAN_CARRY);
+				have = SCAN_CARRY;
+			}
+		}
+	}
+	f = fopen(out, "w");
+	if (!f || fwrite(map, sizeof(*map), nkeys, f) != nkeys || fclose(f))
+		die(out);
+	printf("map items=%lu dup=%lu scanned=%lu MiB candidates=%lu\n", found, dup, bytes >> 20, cand);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct worker *w;
@@ -198,8 +321,11 @@ int main(int argc, char **argv)
 	double dt;
 	void *m;
 
+	if (argc == 5 && !strcmp(argv[1], "map"))
+		return do_map(atoi(argv[2]), strtoul(argv[3], NULL, 10), argv[4]);
 	if (argc != 7 && argc != 8) {
-		fprintf(stderr, "usage: mctrace host port threads TRACE skip ops [qps]\n");
+		fprintf(stderr, "usage: mctrace host port threads TRACE skip ops [qps]\n"
+				"       mctrace map PID keys MAP\n");
 		return 2;
 	}
 	host = argv[1];
