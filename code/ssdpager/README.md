@@ -32,6 +32,11 @@ PATTERN=run:64 sh bench/mc_spd.sh B0:0 none:1200 stream:1200   # 有局部性的
 PATTERN=run:64 sh bench/mc_spd.sh oracle:1200        # 客户端提前告知将访问的页 + 同桶祖先链（mcloc map + spd -P hint，报告 §5.14）
 #   map 文件：每 key 8 个 u64 = 条目地址 + 从桶头到它的祖先（h_next 反查），提示量约为条目本身的 1.5 倍
 SPD_OPTS="-F /tmp/faults.bin" PATTERN=run:64 sh bench/mc_spd.sh oracle:1200   # 记录缺页与提示地址，用于归属分析（报告 §5.14.1）
+# 真实 trace 回放：Twitter cache-trace（bench/twprep.py 转换，bench/mctrace.c 回放）
+zstd -dc cluster52.sort.zst | head -n 40000000 | bench/twprep.py c52.bin   # 输出统计 + 12 字节/条的回放文件
+TRACE=c52.bin WARM=20000000 OPS=2000000 SETTLE=180 MC_OPTS="-o no_lru_crawler" sh bench/mc_spd.sh B0:0 none:600 stream:600
+#   WARM 条填充缓存后才启动 daemon，之后 OPS 条计入测量；QPS=n 按 n 请求/s 开环发送（默认闭环保底）
+#   MC_MEM 覆盖 memcached 的 -m（默认 3072）
 ./sptest evict PID; ./sptest promote PID; ./sptest evacuate; ./sptest stat
 ```
 

@@ -9,6 +9,10 @@
 # PATTERN=run:L or session:S:L replaces the Zipf clients with bench/mcloc.
 # Variant oracle (needs PATTERN): the client tells spd which pages each request
 # LOOKAHEAD (default 256) requests ahead will touch.  SPD_OPTS adds spd options.
+# TRACE=FILE (from bench/twprep.py) replays a request trace with bench/mctrace
+# instead: records [0, WARM) fill the cache before the daemon starts, the next
+# OPS are measured, at QPS requests/s when QPS is set (else closed loop).
+# MC_MEM (default 3072) is memcached's -m.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 port=12346
@@ -38,10 +42,14 @@ for spec do
 	budget=${spec##*:}
 	d=; memc=; idle=0
 	# shellcheck disable=SC2086
-	numactl --cpunodebind=0 --membind=0 memcached -u root -l 127.0.0.1 -p "$port" -m 3072 -t 4 -c 4096 ${MC_OPTS:-} &
+	numactl --cpunodebind=0 --membind=0 memcached -u root -l 127.0.0.1 -p "$port" -m "${MC_MEM:-3072}" -t 4 -c 4096 ${MC_OPTS:-} &
 	memc=$!
 	sleep 1
-	"$here/mcbench" preload 127.0.0.1 "$port" "$threads" "$keys" "$value" 0 "$zipf" 95 > "$out/$variant-$budget.preload"
+	if [ -n "${TRACE:-}" ]; then
+		"$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" 0 "$WARM" > "$out/$variant-$budget.preload"
+	else
+		"$here/mcbench" preload 127.0.0.1 "$port" "$threads" "$keys" "$value" 0 "$zipf" 95 > "$out/$variant-$budget.preload"
+	fi
 	if [ "$variant" = oracle ]; then
 		# every key's item address, taken before anything is evicted
 		"$here/bench/mcloc" map "$memc" "$keys" "$value" "$out/map" > "$out/$variant-$budget.map"
@@ -63,7 +71,9 @@ for spec do
 		idle=$((($(stat fault) - fi) / 10))
 	fi
 	f0=$(stat fault)
-	if [ "$variant" = oracle ]; then
+	if [ -n "${TRACE:-}" ]; then
+		"$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" "$WARM" "$ops" "${QPS:-0}" > "$out/$variant-$budget.steady"
+	elif [ "$variant" = oracle ]; then
 		"$here/bench/mcloc" 127.0.0.1 "$port" "$threads" "$keys" "$value" "$ops" "$getpct" "$seed" "$PATTERN" \
 			"$out/map" "$out/hints" "${LOOKAHEAD:-256}" > "$out/$variant-$budget.steady"
 	elif [ -n "${PATTERN:-}" ]; then
