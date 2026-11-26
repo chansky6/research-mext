@@ -25,8 +25,9 @@ insmod ssdpager.ko dev=$LOOP
 ./sptest trace              # 缺页轨迹与预取记账（命中/浪费/迟到/漏报）
 ./sptest afspec 400         # 推测读取是否置访问位（7 种读法，含屏障对照；报告 §5.10）
 ./sptest afnb 400           # 调用方自带映射时的访问位误报；SP_XPROC=1 改为跨进程下发
-./spd -p PID -b BUDGET_MB -P none|next|markov|both   # daemon：扫描选冷换出 + 缺页轨迹预取（报告 §5.11）
+./spd -p PID -b BUDGET_MB -P none|next|markov|both|stream   # daemon：扫描选冷换出 + 缺页轨迹预取（报告 §5.11–§5.13）
 sh bench/mc_spd.sh B0:0 none:1200 next:1200          # memcached 对比；mcbench 取自 ../predswap/bench/mcbench.c
+PATTERN=run:64 sh bench/mc_spd.sh B0:0 none:1200 stream:1200   # 有局部性的负载（bench/mcloc.c，另有 session:S:L）
 ./sptest evict PID; ./sptest promote PID; ./sptest evacuate; ./sptest stat
 ```
 

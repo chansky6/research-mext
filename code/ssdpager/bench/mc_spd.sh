@@ -2,17 +2,18 @@
 # mc_spd.sh: memcached under spd, fixed work per run.
 # Usage: sh mc_spd.sh VARIANT:BUDGET_MB ...
 # VARIANT is B0 (no daemon, everything in DRAM) or a spd predictor
-# (none|next|markov|both).  Needs ssdpager.ko loaded, swap off, THP never.
+# (none|next|markov|both|stream).  Needs ssdpager.ko loaded, swap off, THP never.
 # mcbench is code/predswap/bench/mcbench.c.  MC_OPTS adds memcached options,
 # e.g. MC_OPTS="-o no_lru_crawler".  idle_fault_s is the demand-fault rate over
 # the last 10 s before the clients start.
+# PATTERN=run:L or session:S:L replaces the Zipf clients with bench/mcloc.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 port=12346
 keys=1000000
 value=2000
 ops=${OPS:-2000000}
-threads=8
+threads=${THREADS:-8}
 zipf=${ZIPF:-1.0}
 seed=${SEED:-11}
 settle=${SETTLE:-90}
@@ -48,7 +49,11 @@ for spec do
 		idle=$((($(stat fault) - fi) / 10))
 	fi
 	f0=$(stat fault)
-	"$here/mcbench" steady 127.0.0.1 "$port" "$threads" "$keys" "$value" "$ops" "$zipf" 95 "$seed" > "$out/$variant-$budget.steady"
+	if [ -n "${PATTERN:-}" ]; then
+		"$here/bench/mcloc" 127.0.0.1 "$port" "$threads" "$keys" "$value" "$ops" 95 "$seed" "$PATTERN" > "$out/$variant-$budget.steady"
+	else
+		"$here/mcbench" steady 127.0.0.1 "$port" "$threads" "$keys" "$value" "$ops" "$zipf" 95 "$seed" > "$out/$variant-$budget.steady"
+	fi
 	f1=$(stat fault)
 	head -3 /dev/ssdpager > "$out/$variant-$budget.module"
 	if [ -n "$d" ]; then

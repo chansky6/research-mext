@@ -33,8 +33,9 @@
 #define PF_SCANS	2		/* scans a prefetched page may stay unused */
 #define MK_BITS		20		/* successor table: 2^20 pages */
 #define MK_WAYS		2
+#define RC_BITS		12		/* stream detector: recent pages */
 
-enum { P_NONE, P_NEXT, P_MARKOV, P_BOTH };
+enum { P_NONE, P_NEXT, P_MARKOV, P_BOTH, P_STREAM };
 
 struct region {
 	uint64_t start, end;
@@ -53,6 +54,7 @@ static struct region *regs;
 static size_t nregs;
 
 static struct { uint64_t page, succ[MK_WAYS]; } *mk;
+static uint64_t recent[1 << RC_BITS];	/* pages lately faulted or prefetched */
 
 /* totals; the prefetch thread owns the pf_ and ev_ ones except hit/waste */
 static unsigned long n_evict, n_hit, n_waste;
@@ -305,10 +307,33 @@ static void mk_learn(uint64_t page, uint64_t next)
 	mk[h].succ[0] = next;
 }
 
-static unsigned int predict(uint64_t page, uint64_t *out, unsigned int n, unsigned int max)
+static size_t rc_slot(uint64_t page)
+{
+	return (page / PG * 0x9e3779b97f4a7c15ULL) >> (64 - RC_BITS);
+}
+
+static void rc_put(uint64_t page)
+{
+	recent[rc_slot(page)] = page;
+}
+
+/* +1 / -1 when the page continues a run of recent faults or prefetches, else 0. */
+static int rc_dir(uint64_t page)
+{
+	int below = recent[rc_slot(page - PG)] == page - PG;
+	int above = recent[rc_slot(page + PG)] == page + PG;
+
+	return below - above;
+}
+
+static unsigned int predict(uint64_t page, int dir, uint64_t *out, unsigned int n,
+			    unsigned int max)
 {
 	unsigned int i;
 
+	if (predictor == P_STREAM && dir)
+		for (i = 1; i <= pf_width && n < max; i++)
+			out[n++] = page + dir * (int64_t)(i * PG);
 	if (predictor == P_NEXT || predictor == P_BOTH)
 		for (i = 1; i <= pf_width && n < max; i++)
 			out[n++] = page + i * PG;
@@ -336,8 +361,9 @@ static void *prefetch_thread(void *arg)
 	struct sp_event *ev = malloc(TRACE_MAX * sizeof(*ev));
 	uint64_t cand[PF_BATCH], want[PF_BATCH], last = 0;
 	uint8_t st[PF_BATCH];
+	int8_t *dir = malloc(TRACE_MAX);
 
-	if (!ev)
+	if (!ev || !dir)
 		die("malloc");
 	while (!stop) {
 		struct sp_trace t = { .buf = (uintptr_t)ev, .nr = TRACE_MAX };
@@ -365,13 +391,17 @@ static void *prefetch_thread(void *arg)
 					mk_learn(last, ev[i].addr);
 				last = ev[i].addr;
 			}
+			if (predictor == P_STREAM) {
+				dir[i] = rc_dir(ev[i].addr);
+				rc_put(ev[i].addr);
+			}
 		}
 		if (predictor == P_NONE)
 			continue;
 		/* the newest faults say most about what comes next */
 		for (i = t.got; i-- > 0 && nc < PF_BATCH; )
 			if (ev[i].pid == pid && ev[i].type == SP_EV_FAULT)
-				nc = predict(ev[i].addr, cand, nc, PF_BATCH);
+				nc = predict(ev[i].addr, dir[i], cand, nc, PF_BATCH);
 		if (nc) {
 			struct sp_query q = { .pid = pid, .nr = nc, .addrs = (uintptr_t)cand,
 					      .states = (uintptr_t)st };
@@ -408,6 +438,10 @@ static void *prefetch_thread(void *arg)
 				if (g && (st[i] == SP_PG_OLD || st[i] == SP_PG_YOUNG))
 					g->pf[(want[i] - g->start) / PG] = 1;
 			}
+			/* a stream goes on from the pages we fetched for it */
+			if (predictor == P_STREAM)
+				for (i = 0; i < nw; i++)
+					rc_put(want[i]);
 			pthread_mutex_unlock(&lock);
 		}
 	}
@@ -421,7 +455,7 @@ static void on_signal(int sig)
 
 int main(int argc, char **argv)
 {
-	static const char *const names[] = { "none", "next", "markov", "both" };
+	static const char *const names[] = { "none", "next", "markov", "both", "stream" };
 	pthread_t ts, tp;
 	int c;
 
@@ -435,16 +469,16 @@ int main(int argc, char **argv)
 		case 'w': pf_width = atoi(optarg); break;
 		case 'd': pf_deadline_ns = strtoull(optarg, NULL, 0) * 1000; break;
 		case 'P':
-			for (predictor = 0; predictor < 4 && strcmp(optarg, names[predictor]); predictor++)
+			for (predictor = 0; predictor < 5 && strcmp(optarg, names[predictor]); predictor++)
 				;
 			break;
 		default: pid = 0;
 		}
 	}
-	if (pid <= 0 || !budget_pages || predictor > P_BOTH || !interval_ms || !min_age ||
+	if (pid <= 0 || !budget_pages || predictor > P_STREAM || !interval_ms || !min_age ||
 	    min_age > 255 || !rate_pages) {
 		fprintf(stderr,
-			"usage: spd -p PID -b BUDGET_MB [-P none|next|markov|both] [-i scan_ms=1000]\n"
+			"usage: spd -p PID -b BUDGET_MB [-P none|next|markov|both|stream] [-i scan_ms=1000]\n"
 			"           [-r evict_pages_per_s=20000] [-a min_age_scans=1]\n"
 			"           [-w prefetch_width=8] [-d prefetch_deadline_us=5000]\n");
 		return 2;
