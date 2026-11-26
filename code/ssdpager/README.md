@@ -29,7 +29,8 @@ insmod ssdpager.ko dev=$LOOP
 #   -F file：按到达顺序记录缺页地址；-P hint 时提示页也写入同一文件（bit63=1）
 sh bench/mc_spd.sh B0:0 none:1200 next:1200          # memcached 对比；mcbench 取自 ../predswap/bench/mcbench.c
 PATTERN=run:64 sh bench/mc_spd.sh B0:0 none:1200 stream:1200   # 有局部性的负载（bench/mcloc.c，另有 session:S:L）
-PATTERN=run:64 sh bench/mc_spd.sh oracle:1200        # 客户端提前告知将访问的页（mcloc map + spd -P hint，报告 §5.14）
+PATTERN=run:64 sh bench/mc_spd.sh oracle:1200        # 客户端提前告知将访问的页 + 同桶祖先链（mcloc map + spd -P hint，报告 §5.14）
+#   map 文件：每 key 8 个 u64 = 条目地址 + 从桶头到它的祖先（h_next 反查），提示量约为条目本身的 1.5 倍
 SPD_OPTS="-F /tmp/faults.bin" PATTERN=run:64 sh bench/mc_spd.sh oracle:1200   # 记录缺页与提示地址，用于归属分析（报告 §5.14.1）
 ./sptest evict PID; ./sptest promote PID; ./sptest evacuate; ./sptest stat
 ```

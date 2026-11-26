@@ -12,6 +12,10 @@
  * (run it while everything is in DRAM: the scan faults pages in).  A run given
  * that map writes, for the request each connection sends LOOKAHEAD requests
  * from now, the pages of that item to FIFO as raw u64 addresses (spd -P hint).
+ * `map` also records the items assoc_find() walks before reaching the item
+ * (the bucket head down to it, found by inverting h_next): memcached reads
+ * the whole chain, so hinting all of it removes the faults the client never
+ * asks for (report §5.14.2).
  * A SET moves the item.  With one connection the new place is the chunk the
  * previous SET freed (the slab free list is LIFO); with more, the item is
  * unknown from then on.
@@ -36,8 +40,10 @@
 #define IT_NBYTES	32
 #define IT_FLAGS	38
 #define IT_NKEY		41
+#define IT_HNEXT	16	/* struct _stritem: next, prev, h_next */
 #define IT_LINKED	1
 #define IT_CAS		2
+#define CHAIN		8	/* map slots per key: the item then its hash-chain peers */
 #define CHUNK		(4UL << 20)
 #define CARRY		128UL
 
@@ -47,7 +53,7 @@ static unsigned int keys, plen, nsess;
 static long value_len, ops_each, lookahead;
 static uint64_t seed0;
 static char *value;
-static uint64_t *map;	/* item address of each key, 0 when unknown */
+static uint64_t *map;	/* CHAIN item addresses per key: the item, then its hash-chain peers */
 
 struct gen {
 	uint64_t rs;
@@ -119,14 +125,22 @@ static int xfer(int fd, const char *req, size_t n, const char *tail)
 
 static void hint(struct worker *w, unsigned int k)
 {
-	uint64_t it = map[k], pages[4], a;
-	size_t n = 0;
+	uint64_t pages[2 * CHAIN], a, it;
+	size_t n = 0, j;
+	int e;
 
-	if (!it)
-		return;
-	for (a = it & ~(PG - 1); a < it + 56 + KEYLEN + 8 + value_len + 2 && n < 4; a += PG)
-		pages[n++] = a;
-	if (write(hint_fd, pages, n * sizeof(*pages)) < 0)
+	for (e = 0; e < CHAIN; e++) {
+		it = map[k * CHAIN + e];
+		if (!it)
+			continue;
+		for (a = it & ~(PG - 1); a < it + 56 + KEYLEN + 8 + value_len + 2 && n < 2 * CHAIN; a += PG) {
+			for (j = 0; j < n && pages[j] != a; j++)
+				;
+			if (j == n)
+				pages[n++] = a;
+		}
+	}
+	if (n && write(hint_fd, pages, n * sizeof(*pages)) < 0)
 		w->hint_lost++;
 }
 
@@ -168,9 +182,10 @@ static void *work(void *p)
 			break;
 		}
 		if (map && !get) {
-			uint64_t old = map[k];
+			uint64_t old = map[k * CHAIN];
 
-			map[k] = threads == 1 ? freed : 0;
+			map[k * CHAIN] = threads == 1 ? freed : 0;
+			memset(map + k * CHAIN + 1, 0, (CHAIN - 1) * sizeof(*map));
 			freed = old;
 		}
 		w->err += get && r;
@@ -210,15 +225,65 @@ static unsigned int item_at(const unsigned char *b, size_t i, unsigned int *k)
 	return 0;
 }
 
+/* h_next links (addr -> next) collected during the scan, for reverse lookup. */
+struct link {
+	uint64_t addr, prev;
+};
+
+static struct link *ltab;
+static size_t ltab_sz;
+
+static void ltab_put(uint64_t addr, uint64_t prev)
+{
+	size_t h = (addr >> 4) & (ltab_sz - 1);
+
+	while (ltab[h].addr)
+		h = (h + 1) & (ltab_sz - 1);
+	ltab[h].addr = addr;
+	ltab[h].prev = prev;
+}
+
+/* The item that h_next points at addr, 0 if none. */
+static uint64_t ltab_prev(uint64_t addr)
+{
+	size_t h = (addr >> 4) & (ltab_sz - 1);
+
+	while (ltab[h].addr) {
+		if (ltab[h].addr == addr)
+			return ltab[h].prev;
+		h = (h + 1) & (ltab_sz - 1);
+	}
+	return 0;
+}
+
+/* peers[0] is the item; append the items assoc_find() walks through before it,
+ * i.e. the rest of its bucket from the bucket head down to the item. */
+static int chain_fill(int mem, uint64_t *peers)
+{
+	uint64_t cur = peers[0];
+	int n = 1;
+
+	while (n < CHAIN) {
+		uint64_t prev = ltab_prev(cur);
+
+		if (!prev)
+			break;
+		peers[n++] = prev;
+		cur = prev;
+	}
+	return n;
+}
+
 static int do_map(int pid, const char *out)
 {
 	unsigned char *buf = malloc(CARRY + CHUNK);
 	char path[64], line[512];
-	unsigned long found = 0, dup = 0;
+	unsigned long found = 0, dup = 0, chain_len = 0;
+	unsigned int k;
 	FILE *maps, *f;
 	int mem;
 
-	map = calloc(keys, sizeof(*map));
+	map = calloc((size_t)keys * CHAIN, sizeof(*map));
 	snprintf(path, sizeof(path), "/proc/%d/maps", pid);
 	maps = fopen(path, "r");
 	snprintf(path, sizeof(path), "/proc/%d/mem", pid);
@@ -250,9 +315,9 @@ static int do_map(int pid, const char *out)
 
 				if (buf[i] != 'k' || !(hdr = item_at(buf, i, &k)) || k >= keys)
 					continue;
-				dup += map[k] && map[k] != a - have + i - hdr;
-				found += !map[k];
-				map[k] = a - have + i - hdr;
+				dup += map[k * CHAIN] && map[k * CHAIN] != a - have + i - hdr;
+				found += !map[k * CHAIN];
+				map[k * CHAIN] = a - have + i - hdr;
 			}
 			if (have > CARRY) {
 				memmove(buf, buf + have - CARRY, CARRY);
@@ -260,10 +325,41 @@ static int do_map(int pid, const char *out)
 			}
 		}
 	}
+	/* Second pass: h_next of every item, inverted so each item can find its
+	 * predecessors; assoc_find() walks those before reaching the item. */
+	ltab_sz = 1;
+	while (ltab_sz < (size_t)keys * 2)
+		ltab_sz <<= 1;
+	ltab = calloc(ltab_sz, sizeof(*ltab));
+	if (!ltab)
+		die("calloc");
+	for (k = 0; k < keys; k++) {
+		uint64_t next;
+
+		if (!map[k * CHAIN])
+			continue;
+		if (pread(mem, &next, sizeof(next), map[k * CHAIN] + IT_HNEXT) != sizeof(next))
+			continue;
+		if (next)
+			ltab_put(next, map[k * CHAIN]);
+	}
+	for (k = 0; k < keys; k++) {
+		uint64_t peers[CHAIN];
+		int np, j;
+
+		if (!map[k * CHAIN])
+			continue;
+		peers[0] = map[k * CHAIN];
+		np = chain_fill(mem, peers);
+		chain_len += np;
+		for (j = 1; j < np; j++)
+			map[k * CHAIN + j] = peers[j];
+	}
 	f = fopen(out, "w");
-	if (!f || fwrite(map, sizeof(*map), keys, f) != keys || fclose(f))
+	if (!f || fwrite(map, sizeof(*map), (size_t)keys * CHAIN, f) != (size_t)keys * CHAIN || fclose(f))
 		die(out);
-	printf("map keys=%u found=%lu dup=%lu\n", keys, found, dup);
+	printf("map keys=%u found=%lu dup=%lu chain_avg=%.2f\n", keys, found, dup,
+	       found ? (double)chain_len / found : 0.0);
 	return found == keys && !dup ? 0 : 1;
 }
 
@@ -305,8 +401,8 @@ int main(int argc, char **argv)
 	if (argc == 13) {
 		FILE *f = fopen(argv[10], "r");
 
-		map = malloc(keys * sizeof(*map));
-		if (!f || !map || fread(map, sizeof(*map), keys, f) != keys)
+		map = malloc((size_t)keys * CHAIN * sizeof(*map));
+		if (!f || !map || fread(map, sizeof(*map), (size_t)keys * CHAIN, f) != (size_t)keys * CHAIN)
 			die(argv[10]);
 		fclose(f);
 		hint_fd = open(argv[11], O_WRONLY | O_NONBLOCK);
