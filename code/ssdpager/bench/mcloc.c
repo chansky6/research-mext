@@ -7,9 +7,18 @@
  *   run:L        pick a key uniformly, then touch it and the L-1 keys after it
  *   session:S:L  S fixed lists of L random keys; pick a list uniformly and
  *                touch its keys in order
+ *
+ * Oracle hints: `mcloc map` finds every key's item in the server's memory
+ * (run it while everything is in DRAM: the scan faults pages in).  A run given
+ * that map writes, for the request each connection sends LOOKAHEAD requests
+ * from now, the pages of that item to FIFO as raw u64 addresses (spd -P hint).
+ * A SET moves the item.  With one connection the new place is the chunk the
+ * previous SET freed (the slab free list is LIFO); with more, the item is
+ * unknown from then on.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -21,17 +30,34 @@
 #include <time.h>
 #include <unistd.h>
 
+#define PG		4096UL
+#define KEYLEN		8
+/* memcached 1.6 item header: nbytes at 32, it_flags at 38, nkey at 41, key at 48 or 56 (CAS) */
+#define IT_NBYTES	32
+#define IT_FLAGS	38
+#define IT_NKEY		41
+#define IT_LINKED	1
+#define IT_CAS		2
+#define CHUNK		(4UL << 20)
+#define CARRY		128UL
+
 static const char *host;
-static int port, get_pct, is_session;
+static int port, get_pct, is_session, threads, hint_fd = -1;
 static unsigned int keys, plen, nsess;
-static long value_len, ops_each;
+static long value_len, ops_each, lookahead;
 static uint64_t seed0;
 static char *value;
+static uint64_t *map;	/* item address of each key, 0 when unknown */
+
+struct gen {
+	uint64_t rs;
+	unsigned int pos, base;
+};
 
 struct worker {
 	pthread_t th;
 	unsigned int id;
-	long done, err;
+	long done, err, hinted, hint_lost;
 	int *lat;
 };
 
@@ -47,6 +73,24 @@ static uint64_t mix(uint64_t x)
 	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
 	x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
 	return x ^ (x >> 31);
+}
+
+/* The next request of a connection: its key, and whether it is a GET. */
+static unsigned int gen_next(struct gen *g, int *get)
+{
+	unsigned int k;
+
+	if (g->pos == plen) {
+		g->rs = mix(g->rs);
+		g->base = g->rs % (is_session ? nsess : keys);
+		g->pos = 0;
+	}
+	/* a session's keys depend only on the seed, so every visit repeats them */
+	k = is_session ? mix(seed0 ^ ((uint64_t)g->base << 20 | g->pos)) % keys : (g->base + g->pos) % keys;
+	g->pos++;
+	g->rs = mix(g->rs);
+	*get = (int)(g->rs % 100) < get_pct;
+	return k;
 }
 
 static int xfer(int fd, const char *req, size_t n, const char *tail)
@@ -73,14 +117,27 @@ static int xfer(int fd, const char *req, size_t n, const char *tail)
 	return -1;
 }
 
+static void hint(struct worker *w, unsigned int k)
+{
+	uint64_t it = map[k], pages[4], a;
+	size_t n = 0;
+
+	if (!it)
+		return;
+	for (a = it & ~(PG - 1); a < it + 56 + KEYLEN + 8 + value_len + 2 && n < 4; a += PG)
+		pages[n++] = a;
+	if (write(hint_fd, pages, n * sizeof(*pages)) < 0)
+		w->hint_lost++;
+}
+
 static void *work(void *p)
 {
 	struct worker *w = p;
 	struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons(port) };
-	uint64_t rs = mix(seed0 + w->id);
+	struct gen g = { .rs = mix(seed0 + w->id), .pos = plen }, ahead = g;
 	char *req = malloc(value_len + 64);
 	int fd = socket(AF_INET, SOCK_STREAM, 0), one = 1;
-	unsigned int pos = plen, base = 0;
+	uint64_t freed = 0;
 
 	w->lat = malloc(ops_each * sizeof(int));
 	if (fd < 0 || !req || !w->lat || inet_pton(AF_INET, host, &sa.sin_addr) != 1 ||
@@ -92,16 +149,9 @@ static void *work(void *p)
 		unsigned int k;
 		int n, get, r;
 
-		if (pos == plen) {
-			rs = mix(rs);
-			base = rs % (is_session ? nsess : keys);
-			pos = 0;
-		}
-		/* a session's keys depend only on the seed, so every visit repeats them */
-		k = is_session ? mix(seed0 ^ ((uint64_t)base << 20 | pos)) % keys : (base + pos) % keys;
-		pos++;
-		rs = mix(rs);
-		get = (int)(rs % 100) < get_pct;
+		for (; map && w->hinted < ops_each && w->hinted <= w->done + lookahead; w->hinted++)
+			hint(w, gen_next(&ahead, &r));
+		k = gen_next(&g, &get);
 		if (get) {
 			n = sprintf(req, "get k%07u\r\n", k);
 		} else {
@@ -117,6 +167,12 @@ static void *work(void *p)
 			w->err++;
 			break;
 		}
+		if (map && !get) {
+			uint64_t old = map[k];
+
+			map[k] = threads == 1 ? freed : 0;
+			freed = old;
+		}
 		w->err += get && r;
 		w->lat[w->done++] = (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000;
 	}
@@ -130,18 +186,106 @@ static int cmp_int(const void *x, const void *y)
 	return (*(const int *)x > *(const int *)y) - (*(const int *)x < *(const int *)y);
 }
 
+/* Is the "k%07u" at b[i] the key of a linked item of ours?  Returns its header length. */
+static unsigned int item_at(const unsigned char *b, size_t i, unsigned int *k)
+{
+	unsigned int hdr, j;
+
+	for (*k = 0, j = 1; j < KEYLEN; j++) {
+		if (b[i + j] < '0' || b[i + j] > '9')
+			return 0;
+		*k = *k * 10 + b[i + j] - '0';
+	}
+	for (hdr = 48; hdr <= 56; hdr += 8) {
+		const unsigned char *it = b + i - hdr;
+		int32_t nbytes;
+		uint16_t flags;
+
+		memcpy(&nbytes, it + IT_NBYTES, sizeof(nbytes));
+		memcpy(&flags, it + IT_FLAGS, sizeof(flags));
+		if (it[IT_NKEY] == KEYLEN && nbytes == value_len + 2 && (flags & IT_LINKED) &&
+		    !(flags & IT_CAS) == (hdr == 48))
+			return hdr;
+	}
+	return 0;
+}
+
+static int do_map(int pid, const char *out)
+{
+	unsigned char *buf = malloc(CARRY + CHUNK);
+	char path[64], line[512];
+	unsigned long found = 0, dup = 0;
+	FILE *maps, *f;
+	int mem;
+
+	map = calloc(keys, sizeof(*map));
+	snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+	maps = fopen(path, "r");
+	snprintf(path, sizeof(path), "/proc/%d/mem", pid);
+	mem = open(path, O_RDONLY);
+	if (!buf || !map || !maps || mem < 0)
+		die("map");
+	while (fgets(line, sizeof(line), maps)) {
+		unsigned long s, e, ino, a;
+		char perm[8], name[256] = "";
+		size_t have = 0;	/* bytes of buf that end at address a */
+
+		if (sscanf(line, "%lx-%lx %7s %*x %*s %lu %255s", &s, &e, perm, &ino, name) < 4)
+			continue;
+		if (strcmp(perm, "rw-p") || ino || (name[0] && strcmp(name, "[heap]")))
+			continue;
+		for (a = s; a < e; ) {
+			size_t want = e - a < CHUNK ? e - a : CHUNK, i;
+			ssize_t r = pread(mem, buf + have, want, a);
+
+			if (r <= 0) {	/* unreadable: skip a page, items do not span it */
+				a += PG;
+				have = 0;
+				continue;
+			}
+			a += r;
+			have += r;
+			for (i = 56; i + KEYLEN <= have; i++) {
+				unsigned int k, hdr;
+
+				if (buf[i] != 'k' || !(hdr = item_at(buf, i, &k)) || k >= keys)
+					continue;
+				dup += map[k] && map[k] != a - have + i - hdr;
+				found += !map[k];
+				map[k] = a - have + i - hdr;
+			}
+			if (have > CARRY) {
+				memmove(buf, buf + have - CARRY, CARRY);
+				have = CARRY;
+			}
+		}
+	}
+	f = fopen(out, "w");
+	if (!f || fwrite(map, sizeof(*map), keys, f) != keys || fclose(f))
+		die(out);
+	printf("map keys=%u found=%lu dup=%lu\n", keys, found, dup);
+	return found == keys && !dup ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
 	struct timespec t0, t1;
 	struct worker *w;
-	long done = 0, err = 0, i;
-	int threads, t, *all;
+	long done = 0, err = 0, hint_lost = 0, i;
+	int t, *all;
 	double dt;
 
-	if (argc != 10 ||
+	if (argc == 6 && !strcmp(argv[1], "map")) {
+		keys = strtoul(argv[3], NULL, 10);
+		value_len = atol(argv[4]);
+		return do_map(atoi(argv[2]), argv[5]);
+	}
+	if ((argc != 10 && argc != 13) ||
 	    (sscanf(argv[9], "session:%u:%u", &nsess, &plen) != 2 && sscanf(argv[9], "run:%u", &plen) != 1) ||
 	    !plen) {
-		fprintf(stderr, "usage: mcloc host port threads keys value ops get_pct seed run:L|session:S:L\n");
+		fprintf(stderr,
+			"usage: mcloc host port threads keys value ops get_pct seed run:L|session:S:L [MAP FIFO LOOKAHEAD]\n"
+			"       mcloc map PID keys value MAP\n");
 		return 2;
 	}
 	is_session = nsess > 0;
@@ -158,6 +302,18 @@ int main(int argc, char **argv)
 	all = malloc(ops_each * threads * sizeof(int));
 	if (!value || !w || !all)
 		die("malloc");
+	if (argc == 13) {
+		FILE *f = fopen(argv[10], "r");
+
+		map = malloc(keys * sizeof(*map));
+		if (!f || !map || fread(map, sizeof(*map), keys, f) != keys)
+			die(argv[10]);
+		fclose(f);
+		hint_fd = open(argv[11], O_WRONLY | O_NONBLOCK);
+		if (hint_fd < 0)
+			die(argv[11]);
+		lookahead = atol(argv[12]);
+	}
 	for (i = 0; i < value_len; i++)
 		value[i] = 'a' + i % 26;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -171,14 +327,15 @@ int main(int argc, char **argv)
 		memcpy(all + done, w[t].lat, w[t].done * sizeof(int));
 		done += w[t].done;
 		err += w[t].err;
+		hint_lost += w[t].hint_lost;
 	}
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	dt = t1.tv_sec - t0.tv_sec + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 	qsort(all, done, sizeof(int), cmp_int);
 	if (!done)
 		return 1;
-	printf("steady ops=%ld seconds=%.3f rate=%.0f/s p50=%dus p99=%dus p999=%dus err=%ld get_pct=%d pattern=%s\n",
+	printf("steady ops=%ld seconds=%.3f rate=%.0f/s p50=%dus p99=%dus p999=%dus err=%ld get_pct=%d pattern=%s hint_lost=%ld\n",
 	       done, dt, done / dt, all[done / 2], all[done * 99 / 100], all[done * 999 / 1000],
-	       err, get_pct, argv[9]);
+	       err, get_pct, argv[9], hint_lost);
 	return 0;
 }

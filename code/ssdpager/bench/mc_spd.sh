@@ -7,6 +7,8 @@
 # e.g. MC_OPTS="-o no_lru_crawler".  idle_fault_s is the demand-fault rate over
 # the last 10 s before the clients start.
 # PATTERN=run:L or session:S:L replaces the Zipf clients with bench/mcloc.
+# Variant oracle (needs PATTERN): the client tells spd which pages each request
+# LOOKAHEAD (default 256) requests ahead will touch.  SPD_OPTS adds spd options.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 port=12346
@@ -16,6 +18,7 @@ ops=${OPS:-2000000}
 threads=${THREADS:-8}
 zipf=${ZIPF:-1.0}
 seed=${SEED:-11}
+getpct=${GET_PCT:-95}
 settle=${SETTLE:-90}
 out=$(mktemp -d /tmp/mc-spd.XXXXXX)
 memc=; d=
@@ -39,9 +42,20 @@ for spec do
 	memc=$!
 	sleep 1
 	"$here/mcbench" preload 127.0.0.1 "$port" "$threads" "$keys" "$value" 0 "$zipf" 95 > "$out/$variant-$budget.preload"
-	if [ "$variant" != B0 ]; then
-		"$here/spd" -p "$memc" -b "$budget" -P "$variant" > "$out/$variant-$budget.spd" &
+	if [ "$variant" = oracle ]; then
+		# every key's item address, taken before anything is evicted
+		"$here/bench/mcloc" map "$memc" "$keys" "$value" "$out/map" > "$out/$variant-$budget.map"
+		rm -f "$out/hints"
+		mkfifo "$out/hints"
+		# shellcheck disable=SC2086
+		"$here/spd" -p "$memc" -b "$budget" -P hint -H "$out/hints" ${SPD_OPTS:-} > "$out/$variant-$budget.spd" &
 		d=$!
+	elif [ "$variant" != B0 ]; then
+		# shellcheck disable=SC2086
+		"$here/spd" -p "$memc" -b "$budget" -P "$variant" ${SPD_OPTS:-} > "$out/$variant-$budget.spd" &
+		d=$!
+	fi
+	if [ -n "$d" ]; then
 		# let the daemon reach the budget while the keyspace is idle
 		sleep "$((settle - 10))"
 		fi=$(stat fault)
@@ -49,10 +63,13 @@ for spec do
 		idle=$((($(stat fault) - fi) / 10))
 	fi
 	f0=$(stat fault)
-	if [ -n "${PATTERN:-}" ]; then
-		"$here/bench/mcloc" 127.0.0.1 "$port" "$threads" "$keys" "$value" "$ops" 95 "$seed" "$PATTERN" > "$out/$variant-$budget.steady"
+	if [ "$variant" = oracle ]; then
+		"$here/bench/mcloc" 127.0.0.1 "$port" "$threads" "$keys" "$value" "$ops" "$getpct" "$seed" "$PATTERN" \
+			"$out/map" "$out/hints" "${LOOKAHEAD:-256}" > "$out/$variant-$budget.steady"
+	elif [ -n "${PATTERN:-}" ]; then
+		"$here/bench/mcloc" 127.0.0.1 "$port" "$threads" "$keys" "$value" "$ops" "$getpct" "$seed" "$PATTERN" > "$out/$variant-$budget.steady"
 	else
-		"$here/mcbench" steady 127.0.0.1 "$port" "$threads" "$keys" "$value" "$ops" "$zipf" 95 "$seed" > "$out/$variant-$budget.steady"
+		"$here/mcbench" steady 127.0.0.1 "$port" "$threads" "$keys" "$value" "$ops" "$zipf" "$getpct" "$seed" > "$out/$variant-$budget.steady"
 	fi
 	f1=$(stat fault)
 	head -3 /dev/ssdpager > "$out/$variant-$budget.module"

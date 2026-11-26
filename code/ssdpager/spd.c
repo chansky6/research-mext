@@ -7,9 +7,10 @@
  * evict the oldest ones until the resident set fits the budget.
  *
  * Prefetch thread: drain the demand-fault trace (SP_TRACE), ask a predictor
- * which pages come next, and bring those back with SP_PROMOTEV.  A prefetched
- * page is a hit when a later scan finds it accessed, wasted when it stays
- * untouched for SP_PF_SCANS scans or is evicted again.
+ * which pages come next (or, with -P hint, take them from a FIFO), and bring
+ * those back with SP_PROMOTEV.  A prefetched page is a hit when a later scan
+ * finds it accessed, wasted when it stays untouched for SP_PF_SCANS scans or
+ * is evicted again.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -35,7 +36,7 @@
 #define MK_WAYS		2
 #define RC_BITS		12		/* stream detector: recent pages */
 
-enum { P_NONE, P_NEXT, P_MARKOV, P_BOTH, P_STREAM };
+enum { P_NONE, P_NEXT, P_MARKOV, P_BOTH, P_STREAM, P_HINT };
 
 struct region {
 	uint64_t start, end;
@@ -43,7 +44,7 @@ struct region {
 	uint8_t *pf;	/* 0, or 1 + scans since it was prefetched */
 };
 
-static int fd, pid, predictor = P_NONE;
+static int fd, pid, predictor = P_NONE, hint_fd = -1;
 static unsigned long budget_pages, rate_pages = 20000;
 static unsigned int interval_ms = 1000, min_age = 1, pf_width = 8;
 static uint64_t pf_deadline_ns = 5000000;
@@ -372,7 +373,13 @@ static void *prefetch_thread(void *arg)
 		if (ioctl(fd, SP_TRACE, &t))
 			die("SP_TRACE");
 		ev_lost = t.lost;
-		if (!t.got) {
+		if (predictor == P_HINT) {
+			ssize_t r = read(hint_fd, cand, sizeof(cand));
+
+			if (r > 0)
+				nc = r / sizeof(*cand);
+		}
+		if (!t.got && !nc) {
 			usleep(200);
 			continue;
 		}
@@ -455,11 +462,12 @@ static void on_signal(int sig)
 
 int main(int argc, char **argv)
 {
-	static const char *const names[] = { "none", "next", "markov", "both", "stream" };
+	static const char *const names[] = { "none", "next", "markov", "both", "stream", "hint" };
+	const char *hint_path = NULL;
 	pthread_t ts, tp;
 	int c;
 
-	while ((c = getopt(argc, argv, "p:b:P:i:r:a:w:d:")) != -1) {
+	while ((c = getopt(argc, argv, "p:b:P:i:r:a:w:d:H:")) != -1) {
 		switch (c) {
 		case 'p': pid = atoi(optarg); break;
 		case 'b': budget_pages = strtoul(optarg, NULL, 0) << 8; break;
@@ -468,21 +476,25 @@ int main(int argc, char **argv)
 		case 'a': min_age = atoi(optarg); break;
 		case 'w': pf_width = atoi(optarg); break;
 		case 'd': pf_deadline_ns = strtoull(optarg, NULL, 0) * 1000; break;
+		case 'H': hint_path = optarg; break;
 		case 'P':
-			for (predictor = 0; predictor < 5 && strcmp(optarg, names[predictor]); predictor++)
+			for (predictor = 0; predictor < 6 && strcmp(optarg, names[predictor]); predictor++)
 				;
 			break;
 		default: pid = 0;
 		}
 	}
-	if (pid <= 0 || !budget_pages || predictor > P_STREAM || !interval_ms || !min_age ||
-	    min_age > 255 || !rate_pages) {
+	if (pid <= 0 || !budget_pages || predictor > P_HINT || !interval_ms || !min_age ||
+	    min_age > 255 || !rate_pages || (predictor == P_HINT) != !!hint_path) {
 		fprintf(stderr,
-			"usage: spd -p PID -b BUDGET_MB [-P none|next|markov|both|stream] [-i scan_ms=1000]\n"
+			"usage: spd -p PID -b BUDGET_MB [-P none|next|markov|both|stream|hint] [-i scan_ms=1000]\n"
 			"           [-r evict_pages_per_s=20000] [-a min_age_scans=1]\n"
-			"           [-w prefetch_width=8] [-d prefetch_deadline_us=5000]\n");
+			"           [-w prefetch_width=8] [-d prefetch_deadline_us=5000]\n"
+			"           [-H fifo]   with -P hint: page addresses (raw u64) to prefetch\n");
 		return 2;
 	}
+	if (hint_path && (hint_fd = open(hint_path, O_RDONLY | O_NONBLOCK)) < 0)
+		die(hint_path);
 	fd = open("/dev/ssdpager", O_RDWR);
 	if (fd < 0)
 		die("/dev/ssdpager");
