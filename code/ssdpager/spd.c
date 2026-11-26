@@ -45,6 +45,7 @@ struct region {
 };
 
 static int fd, pid, predictor = P_NONE, hint_fd = -1;
+static FILE *fault_log;	/* -F: address of every demand fault, raw u64 */
 static unsigned long budget_pages, rate_pages = 20000;
 static unsigned int interval_ms = 1000, min_age = 1, pf_width = 8;
 static uint64_t pf_deadline_ns = 5000000;
@@ -376,8 +377,14 @@ static void *prefetch_thread(void *arg)
 		if (predictor == P_HINT) {
 			ssize_t r = read(hint_fd, cand, sizeof(cand));
 
-			if (r > 0)
+			if (r > 0) {
 				nc = r / sizeof(*cand);
+				for (i = 0; fault_log && i < nc; i++) {
+					uint64_t h = cand[i] | 1ULL << 63;
+
+					fwrite(&h, sizeof(h), 1, fault_log);
+				}
+			}
 		}
 		if (!t.got && !nc) {
 			usleep(200);
@@ -393,6 +400,8 @@ static void *prefetch_thread(void *arg)
 			if (ev[i].type != SP_EV_FAULT)
 				continue;
 			ev_fault++;
+			if (fault_log)
+				fwrite(&ev[i].addr, sizeof(ev[i].addr), 1, fault_log);
 			if (predictor == P_MARKOV || predictor == P_BOTH) {
 				if (last)
 					mk_learn(last, ev[i].addr);
@@ -463,11 +472,11 @@ static void on_signal(int sig)
 int main(int argc, char **argv)
 {
 	static const char *const names[] = { "none", "next", "markov", "both", "stream", "hint" };
-	const char *hint_path = NULL;
+	const char *hint_path = NULL, *fault_path = NULL;
 	pthread_t ts, tp;
 	int c;
 
-	while ((c = getopt(argc, argv, "p:b:P:i:r:a:w:d:H:")) != -1) {
+	while ((c = getopt(argc, argv, "p:b:P:i:r:a:w:d:H:F:")) != -1) {
 		switch (c) {
 		case 'p': pid = atoi(optarg); break;
 		case 'b': budget_pages = strtoul(optarg, NULL, 0) << 8; break;
@@ -477,6 +486,7 @@ int main(int argc, char **argv)
 		case 'w': pf_width = atoi(optarg); break;
 		case 'd': pf_deadline_ns = strtoull(optarg, NULL, 0) * 1000; break;
 		case 'H': hint_path = optarg; break;
+		case 'F': fault_path = optarg; break;
 		case 'P':
 			for (predictor = 0; predictor < 6 && strcmp(optarg, names[predictor]); predictor++)
 				;
@@ -490,11 +500,14 @@ int main(int argc, char **argv)
 			"usage: spd -p PID -b BUDGET_MB [-P none|next|markov|both|stream|hint] [-i scan_ms=1000]\n"
 			"           [-r evict_pages_per_s=20000] [-a min_age_scans=1]\n"
 			"           [-w prefetch_width=8] [-d prefetch_deadline_us=5000]\n"
-			"           [-H fifo]   with -P hint: page addresses (raw u64) to prefetch\n");
+			"           [-H fifo]   with -P hint: page addresses (raw u64) to prefetch\n"
+			"           [-F file]   log demand-fault addresses and, with bit 63 set, hints (raw u64)\n");
 		return 2;
 	}
 	if (hint_path && (hint_fd = open(hint_path, O_RDONLY | O_NONBLOCK)) < 0)
 		die(hint_path);
+	if (fault_path && !(fault_log = fopen(fault_path, "w")))
+		die(fault_path);
 	fd = open("/dev/ssdpager", O_RDWR);
 	if (fd < 0)
 		die("/dev/ssdpager");
@@ -509,5 +522,7 @@ int main(int argc, char **argv)
 	pthread_join(tp, NULL);
 	printf("total evict=%lu fault=%lu late=%lu pf_asked=%lu pf_done=%lu hit=%lu waste=%lu\n",
 	       n_evict, ev_fault, ev_late, pf_asked, pf_done, n_hit, n_waste);
+	if (fault_log && fclose(fault_log))
+		die("fault log");
 	return 0;
 }
