@@ -23,6 +23,8 @@ insmod ssdpager.ko dev=$LOOP
 ./sptest slots 1024         # 随机缺页 + 重新换出后的槽位连续度（见报告 §5.9）
 ./sptest vec                # 离散页批量、过期丢弃、页状态查询
 ./sptest trace              # 缺页轨迹与预取记账（命中/浪费/迟到/漏报）
+./sptest afspec 400         # 推测读取是否置访问位（7 种读法，含屏障对照；报告 §5.10）
+./sptest afnb 400           # 调用方自带映射时的访问位误报；SP_XPROC=1 改为跨进程下发
 ./sptest evict PID; ./sptest promote PID; ./sptest evacuate; ./sptest stat
 ```
 
@@ -33,7 +35,7 @@ insmod ssdpager.ko dev=$LOOP
 | 预取一组散页 | `SP_PROMOTEV {pid, addrs, nr, deadline_ns}` | 按数组顺序处理，最紧迫的放前面；256 页一批并发读；到期未开始的条目丢弃，`dropped` 返回条数 |
 | 换出一组冷页 | `SP_EVICTV` | 同一批写出的页在盘上连续 |
 | 取缺页轨迹 | `SP_TRACE {buf, nr}` | 每条 `{ts_ns, addr, pid, type, lat_ns}`；读走即消费；环 65536 条，溢出覆盖最旧并计 `lost` |
-| 判定预取结果 | `SP_QUERY {pid, addrs, nr, states}` | 窗口到期后查预取过的页：`SP_PG_YOUNG` 命中，`SP_PG_OLD` 浪费 |
+| 判定预取结果 | `SP_QUERY {pid, addrs, nr, states}` | 窗口到期后查预取过的页：`SP_PG_YOUNG` 命中，`SP_PG_OLD` 浪费。命中数是上界：应用的推测执行也会置访问位（报告 §5.10） |
 
 事件类型：`SP_EV_FAULT` 漏报（缺页，带服务时间）；`SP_EV_LATE` 访问被在途的换入批阻塞；`SP_EV_EVICT_WAIT` 访问被在途的换出批阻塞（冷页选错的信号）。后两者靠 `migration_entry_wait` 上的 kprobe，`sptest stat` 里 `wait_probe 1` 表示已挂上。一条事件对应一次被阻塞的访问，不带等待时长。
 
