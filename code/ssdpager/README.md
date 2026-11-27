@@ -93,3 +93,5 @@ sequenceDiagram
 - 从 `migrate_vma_setup` 到 finalize 之间，目标进程访问这批页会阻塞，最长一批的读时间。
 - 读错、校验错或 DRAM 分配失败的页留在 SSD 上，不计入 `done`，不发信号；应用之后访问到读错/校验错的页时在缺页路径上收到 SIGBUS。
 - 模块不限速，节流由调用方切分区间实现。
+#   页级上限（Belady 与 LRU 对照，判断预测还有多少空间）：
+#     python3 bench/ceil.py TRACE MAP NK BUDGET_MB WARM MEAS [WARMUP]
