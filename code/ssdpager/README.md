@@ -38,6 +38,7 @@ TRACE=c52.bin WARM=20000000 OPS=2000000 SETTLE=180 MC_OPTS="-o no_lru_crawler" s
 #   WARM 条填充缓存后才启动 daemon，测量 [SKIP, SKIP+OPS)（SKIP 默认等于 WARM）；
 #   WARM 超过 trace 长度可先建满整个 keyspace，测量窗口就没有冷启动；QPS=n 开环发送（默认闭环）
 bench/mctrace map PID KEYS MAP      # 每个 key 的条目地址（u64 addr, u32 nbytes, u32 ksize），用于页级分析
+#   TRACE_MAP=KEYS 让 mc_spd.sh 在预热后、换出前自动取 map（$variant-$budget.imap）和 /proc/PID/maps，配合 SPD_OPTS="-F file" 做缺页归属（报告 §5.15）
 #   MC_MEM 覆盖 memcached 的 -m（默认 3072）
 ./sptest evict PID; ./sptest promote PID; ./sptest evacuate; ./sptest stat
 ```

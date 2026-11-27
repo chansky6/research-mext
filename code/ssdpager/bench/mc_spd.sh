@@ -54,6 +54,11 @@ for spec do
 		"$here/mcbench" preload 127.0.0.1 "$port" "$threads" "$keys" "$value" 0 "$zipf" 95 > "$out/$variant-$budget.preload"
 	fi
 	fi
+	if [ -n "${TRACE:-}" ] && [ -n "${TRACE_MAP:-}" ]; then
+		# item address of every key and the region layout, before anything is evicted
+		"$here/bench/mctrace" map "$memc" "$TRACE_MAP" "$out/$variant-$budget.imap" > "$out/$variant-$budget.mapout"
+		cp "/proc/$memc/maps" "$out/$variant-$budget.maps"
+	fi
 	if [ "$variant" = oracle ]; then
 		# every key's item address, taken before anything is evicted
 		"$here/bench/mcloc" map "$memc" "$keys" "$value" "$out/map" > "$out/$variant-$budget.map"
