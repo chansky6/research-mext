@@ -40,7 +40,8 @@ enum { P_NONE, P_NEXT, P_MARKOV, P_BOTH, P_STREAM, P_HINT };
 
 struct region {
 	uint64_t start, end;
-	uint8_t *age;	/* scans since last seen accessed, saturating */
+	uint32_t *last;	/* scan tick when it was last seen accessed, 0 = unknown */
+	uint8_t *on;	/* 1 while the page is in DRAM, 0 once it is on the device */
 	uint8_t *pf;	/* 0, or 1 + scans since it was prefetched */
 };
 
@@ -48,6 +49,8 @@ static int fd, pid, predictor = P_NONE, hint_fd = -1;
 static FILE *fault_log;	/* -F: address of every demand fault, raw u64 */
 static unsigned long budget_pages, rate_pages = 20000;
 static unsigned int interval_ms = 1000, min_age = 1, pf_width = 8;
+static uint32_t tick;		/* one per scan; `last` stamps are ticks */
+#define HIST	1024U		/* age buckets, in scans */
 static uint64_t pf_deadline_ns = 5000000;
 static volatile sig_atomic_t stop;
 
@@ -127,9 +130,10 @@ static int regions_refresh(void)
 		}
 		nr[n].start = s;
 		nr[n].end = e;
-		nr[n].age = calloc((e - s) / PG, 1);
+		nr[n].last = calloc((e - s) / PG, sizeof(uint32_t));
+		nr[n].on = calloc((e - s) / PG, 1);
 		nr[n].pf = calloc((e - s) / PG, 1);
-		if (!nr[n].age || !nr[n].pf)
+		if (!nr[n].last || !nr[n].on || !nr[n].pf)
 			die("calloc");
 		n++;
 	}
@@ -141,8 +145,11 @@ static int regions_refresh(void)
 		uint64_t e = nr[i].end < regs[j].end ? nr[i].end : regs[j].end;
 
 		if (s < e) {
-			memcpy(nr[i].age + (s - nr[i].start) / PG,
-			       regs[j].age + (s - regs[j].start) / PG, (e - s) / PG);
+			memcpy(nr[i].last + (s - nr[i].start) / PG,
+			       regs[j].last + (s - regs[j].start) / PG,
+			       (e - s) / PG * sizeof(uint32_t));
+			memcpy(nr[i].on + (s - nr[i].start) / PG,
+			       regs[j].on + (s - regs[j].start) / PG, (e - s) / PG);
 			memcpy(nr[i].pf + (s - nr[i].start) / PG,
 			       regs[j].pf + (s - regs[j].start) / PG, (e - s) / PG);
 		}
@@ -157,7 +164,8 @@ static int regions_refresh(void)
 	nregs = n;
 	pthread_mutex_unlock(&lock);
 	for (j = 0; j < oldn; j++) {
-		free(old[j].age);
+		free(old[j].last);
+		free(old[j].on);
 		free(old[j].pf);
 	}
 	free(old);
@@ -190,10 +198,11 @@ static void *scan_thread(void *arg)
 	if (!st || !victims)
 		die("malloc");
 	while (!stop && regions_refresh()) {
-		unsigned long resident = 0, ssd = 0, hist[256] = { 0 };
+		unsigned long resident = 0, ssd = 0, hist[HIST] = { 0 };
 		unsigned long need, nv = 0, got = 0, left;
 		uint64_t t = now_ns(), ts;
-		unsigned int thr;
+		unsigned int thr, age;
+		uint32_t now_t = ++tick;
 		size_t r;
 
 		/* regs is replaced only by this thread, so it may read it unlocked */
@@ -213,27 +222,32 @@ static void *scan_thread(void *arg)
 					continue;
 				pthread_mutex_lock(&lock);
 				for (i = 0; i < n; i++) {
-					uint8_t *age = &g->age[base + i], *pf = &g->pf[base + i];
+					uint32_t *last = &g->last[base + i];
+					uint8_t *pf = &g->pf[base + i];
 
 					switch (st[i]) {
 					case SP_PG_YOUNG:
-						*age = 0;
+						*last = now_t;
+						g->on[base + i] = 1;
 						n_hit += !!*pf;
 						*pf = 0;
 						resident++;
 						break;
 					case SP_PG_OLD:
-						if (*age < 255)
-							++*age;
 						if (*pf && ++*pf > 1 + PF_SCANS) {
 							n_waste++;
 							*pf = 0;
 						}
-						hist[*age]++;
+						/* exact LRU: age is the number of scans since it
+						 * was last seen, not a saturating counter */
+						g->on[base + i] = 1;
+						age = *last ? now_t - *last : HIST - 1;
+						hist[age < HIST ? age : HIST - 1]++;
 						resident++;
 						break;
 					case SP_PG_SSD:
-						*age = 0;
+						*last = 0;
+						g->on[base + i] = 0;
 						/* a prefetch that was dropped or failed leaves no trace */
 						*pf = 0;
 						ssd++;
@@ -250,30 +264,33 @@ static void *scan_thread(void *arg)
 		if (need > left)
 			need = left;
 		/* oldest first: the lowest age that still yields `need` pages */
-		for (thr = 255, left = 0; thr > min_age && left + hist[thr] < need; thr--)
+		for (thr = HIST - 1, left = 0; thr > min_age && left + hist[thr] < need; thr--)
 			left += hist[thr];
 		for (r = 0; r < nregs && nv < need; r++) {
 			struct region *g = &regs[r];
 			unsigned long n = (g->end - g->start) / PG, i;
 
-			for (i = 0; i < n && nv < need; i++)
-				if (g->age[i] >= thr && g->age[i]) {
-					victims[nv++] = g->start + i * PG;
-					/* an unused prefetched page going back out */
-					pthread_mutex_lock(&lock);
-					n_waste += !!g->pf[i];
-					g->pf[i] = 0;
-					pthread_mutex_unlock(&lock);
-					g->age[i] = 0;
-				}
+			for (i = 0; i < n && nv < need; i++) {
+				uint32_t lst = g->last[i], a = lst ? now_t - lst : HIST;
+
+				if (!g->on[i] || a < thr)
+					continue;
+				victims[nv++] = g->start + i * PG;
+				/* an unused prefetched page going back out */
+				pthread_mutex_lock(&lock);
+				n_waste += !!g->pf[i];
+				g->pf[i] = 0;
+				pthread_mutex_unlock(&lock);
+				g->last[i] = now_t;
+			}
 		}
 		if (nv)
 			got = evict_vec(victims, nv);
 		n_evict += got;
-		printf("t=%.1f resident_mb=%lu ssd_mb=%lu scan_ms=%.1f want=%lu evict=%lu age>=%u "
+		printf("t=%.1f resident_mb=%lu ssd_mb=%lu scan_ms=%.1f want=%lu victims=%lu evict=%lu age>=%u "
 		       "fault=%lu late=%lu evict_wait=%lu pf_asked=%lu pf_done=%lu pf_dropped=%lu "
 		       "hit=%lu waste=%lu lost=%lu\n",
-		       (t - t0) / 1e9, resident >> 8, ssd >> 8, ts / 1e6, need, got, thr,
+		       (t - t0) / 1e9, resident >> 8, ssd >> 8, ts / 1e6, need, nv, got, thr,
 		       ev_fault, ev_late, ev_evict_wait, pf_asked, pf_done, pf_dropped,
 		       n_hit, n_waste, ev_lost);
 		fflush(stdout);
