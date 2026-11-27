@@ -29,9 +29,9 @@ insmod ssdpager.ko dev=$LOOP
 #   -F file：按到达顺序记录缺页地址；-P hint 时提示页也写入同一文件（bit63=1）
 sh bench/mc_spd.sh B0:0 none:1200 next:1200          # memcached 对比；mcbench 取自 ../predswap/bench/mcbench.c
 PATTERN=run:64 sh bench/mc_spd.sh B0:0 none:1200 stream:1200   # 有局部性的负载（bench/mcloc.c，另有 session:S:L）
-PATTERN=run:64 sh bench/mc_spd.sh oracle:1200        # 客户端提前告知将访问的页 + 同桶祖先链（mcloc map + spd -P hint，报告 §5.14）
+PATTERN=run:64 sh bench/mc_spd.sh oracle:1200        # mcloc 合成负载的完美预测（提示条目+祖先链，报告 §5.14）
 #   map 文件：每 key 8 个 u64 = 条目地址 + 从桶头到它的祖先（h_next 反查），提示量约为条目本身的 1.5 倍
-SPD_OPTS="-F /tmp/faults.bin" PATTERN=run:64 sh bench/mc_spd.sh oracle:1200   # 记录缺页与提示地址，用于归属分析（报告 §5.14.1）
+SPD_OPTS="-F /tmp/faults.bin" PATTERN=run:64 sh bench/mc_spd.sh oracle:300  # trace 上 key 级预测上限（报告 §5.16）
 # 真实 trace 回放：Twitter cache-trace（bench/twprep.py 转换，bench/mctrace.c 回放）
 zstd -dc cluster52.sort.zst | head -n 40000000 | bench/twprep.py c52.bin   # 输出统计 + 12 字节/条的回放文件
 TRACE=c52.bin WARM=20000000 OPS=2000000 SETTLE=180 MC_OPTS="-o no_lru_crawler" sh bench/mc_spd.sh B0:0 none:600 stream:600

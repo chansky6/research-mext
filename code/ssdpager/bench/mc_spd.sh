@@ -7,8 +7,9 @@
 # e.g. MC_OPTS="-o no_lru_crawler".  idle_fault_s is the demand-fault rate over
 # the last 10 s before the clients start.
 # PATTERN=run:L or session:S:L replaces the Zipf clients with bench/mcloc.
-# Variant oracle (needs PATTERN): the client tells spd which pages each request
-# LOOKAHEAD (default 256) requests ahead will touch.  SPD_OPTS adds spd options.
+# Variant oracle (needs PATTERN, or TRACE with TRACE_MAP): the client tells spd
+# which pages each request LOOKAHEAD (default 256) requests ahead will touch.
+# SPD_OPTS adds spd options.
 # TRACE=FILE (from bench/twprep.py) replays a request trace with bench/mctrace
 # instead: records [0, WARM) fill the cache before the daemon starts, records
 # [SKIP, SKIP+OPS) are measured (SKIP defaults to WARM), at QPS requests/s when
@@ -61,7 +62,7 @@ for spec do
 	fi
 	if [ "$variant" = oracle ]; then
 		# every key's item address, taken before anything is evicted
-		"$here/bench/mcloc" map "$memc" "$keys" "$value" "$out/map" > "$out/$variant-$budget.map"
+		[ -n "${TRACE:-}" ] || "$here/bench/mcloc" map "$memc" "$keys" "$value" "$out/map" > "$out/$variant-$budget.map"
 		rm -f "$out/hints"
 		mkfifo "$out/hints"
 		# shellcheck disable=SC2086
@@ -84,7 +85,10 @@ for spec do
 		idle=$((($(stat fault) - fi) / 10))
 	fi
 	f0=$(stat fault)
-	if [ -n "${TRACE:-}" ]; then
+	if [ -n "${TRACE:-}" ] && [ "$variant" = oracle ]; then
+		"$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" "${SKIP:-$WARM}" "$ops" "${QPS:-0}" \
+			"$out/$variant-$budget.imap" "$out/hints" "${LOOKAHEAD:-256}" > "$out/$variant-$budget.steady"
+	elif [ -n "${TRACE:-}" ]; then
 		"$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" "${SKIP:-$WARM}" "$ops" "${QPS:-0}" > "$out/$variant-$budget.steady"
 	elif [ "$variant" = oracle ]; then
 		"$here/bench/mcloc" 127.0.0.1 "$port" "$threads" "$keys" "$value" "$ops" "$getpct" "$seed" "$PATTERN" \

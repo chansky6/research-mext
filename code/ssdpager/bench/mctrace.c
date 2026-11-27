@@ -11,6 +11,13 @@
  * With qps > 0 record i is due at start + i / qps and latency is measured from
  * the due time, so a stalled server shows up as latency, not as lower load.
  * With qps 0 every connection sends as fast as it gets answers.
+ *
+ * Oracle hints: given the item map `mctrace map` wrote (take it while
+ * everything is in DRAM), a FIFO and LOOKAHEAD, each connection writes the
+ * pages of the item it will ask for LOOKAHEAD of its own requests from now to
+ * the FIFO as raw u64 addresses (spd -P hint).  Only the item itself is known:
+ * no hash-chain or LRU neighbours.  A SET moves the item, so its key is not
+ * hinted again.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -44,15 +51,25 @@ struct rec {
 	uint16_t ksize, op;
 };
 
+struct addr {
+	uint64_t addr;
+	uint32_t nbytes;
+	uint32_t ksize;
+};
+
 struct worker {
 	pthread_t th;
 	unsigned int id;
 	long done, err, gets, miss;
+	long ahead, hinted, hint_lost;	/* trace cursor of the hints, own requests hinted */
 	int *lat;
 };
 
 static const char *host;
-static int port, threads;
+static int port, threads, hint_fd = -1;
+static struct addr *imap;	/* item of each key, addr 0 when unknown */
+static unsigned long imap_keys;
+static long lookahead;
 static const struct rec *trace;
 static long ops;
 static double qps;
@@ -114,6 +131,20 @@ static double since_start(void)
 	return t.tv_sec - start.tv_sec + (t.tv_nsec - start.tv_nsec) / 1e9;
 }
 
+static void hint(struct worker *w, uint32_t key)
+{
+	uint64_t pages[4], a, end;
+	size_t n = 0;
+
+	if (key >= imap_keys || !imap[key].addr)
+		return;
+	end = imap[key].addr + 56 + imap[key].ksize + imap[key].nbytes + 2;
+	for (a = imap[key].addr & ~(PG - 1); a < end && n < 4; a += PG)
+		pages[n++] = a;
+	if (write(hint_fd, pages, n * sizeof(*pages)) < 0)
+		w->hint_lost++;
+}
+
 static void *work(void *p)
 {
 	struct worker *w = p;
@@ -136,6 +167,12 @@ static void *work(void *p)
 
 		if (r->key % threads != w->id)
 			continue;
+		for (; imap && w->ahead < ops && w->hinted <= w->done + lookahead; w->ahead++) {
+			if (trace[w->ahead].key % threads != w->id)
+				continue;
+			w->hinted++;
+			hint(w, trace[w->ahead].key);
+		}
 		now = since_start();
 		if (qps > 0 && due > now) {
 			struct timespec d = { .tv_sec = (time_t)(due - now),
@@ -165,6 +202,8 @@ static void *work(void *p)
 			double t = since_start();
 
 			w->miss += !set;
+			if (imap && r->key < imap_keys)
+				imap[r->key].addr = 0;
 			if (!set)	/* the GET ends here, the refill is not part of it */
 				w->lat[w->done] = (t - due) * 1e6;
 			n = sprintf(req, "set ");
@@ -201,11 +240,6 @@ static int cmp_int(const void *x, const void *y)
 #define SCAN_CHUNK	(4UL << 20)
 #define SCAN_CARRY	512UL
 
-struct addr {
-	uint64_t addr;
-	uint32_t nbytes;
-	uint32_t ksize;
-};
 
 /* Is the "k%09u"+"x"* at b[i] the key of a linked item of ours?  Returns the
  * header length (48, or 56 with CAS), 0 when no; sets *k and *nk. */
@@ -316,15 +350,15 @@ int main(int argc, char **argv)
 	struct worker *w;
 	struct timespec t1;
 	struct stat st;
-	long done = 0, err = 0, gets = 0, miss = 0, skip, i;
+	long done = 0, err = 0, gets = 0, miss = 0, hint_lost = 0, skip, i;
 	int t, fd, *all;
 	double dt;
 	void *m;
 
 	if (argc == 5 && !strcmp(argv[1], "map"))
 		return do_map(atoi(argv[2]), strtoul(argv[3], NULL, 10), argv[4]);
-	if (argc != 7 && argc != 8) {
-		fprintf(stderr, "usage: mctrace host port threads TRACE skip ops [qps]\n"
+	if (argc != 7 && argc != 8 && argc != 11) {
+		fprintf(stderr, "usage: mctrace host port threads TRACE skip ops [qps [MAP FIFO lookahead]]\n"
 				"       mctrace map PID keys MAP\n");
 		return 2;
 	}
@@ -333,7 +367,23 @@ int main(int argc, char **argv)
 	threads = atoi(argv[3]);
 	skip = atol(argv[5]);
 	ops = atol(argv[6]);
-	qps = argc == 8 ? atof(argv[7]) : 0;
+	qps = argc >= 8 ? atof(argv[7]) : 0;
+	if (argc == 11) {
+		FILE *f = fopen(argv[8], "r");
+
+		if (!f || fseek(f, 0, SEEK_END))
+			die(argv[8]);
+		imap_keys = ftell(f) / sizeof(*imap);
+		imap = malloc(imap_keys * sizeof(*imap));
+		rewind(f);
+		if (!imap || fread(imap, sizeof(*imap), imap_keys, f) != imap_keys)
+			die(argv[8]);
+		fclose(f);
+		hint_fd = open(argv[9], O_WRONLY | O_NONBLOCK);
+		if (hint_fd < 0)
+			die(argv[9]);
+		lookahead = atol(argv[10]);
+	}
 	fd = open(argv[4], O_RDONLY);
 	if (fd < 0 || fstat(fd, &st))
 		die(argv[4]);
@@ -363,14 +413,15 @@ int main(int argc, char **argv)
 		err += w[t].err;
 		gets += w[t].gets;
 		miss += w[t].miss;
+		hint_lost += w[t].hint_lost;
 	}
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	dt = t1.tv_sec - start.tv_sec + (t1.tv_nsec - start.tv_nsec) / 1e9;
 	if (!done)
 		return 1;
 	qsort(all, done, sizeof(int), cmp_int);
-	printf("steady ops=%ld seconds=%.3f rate=%.0f/s p50=%dus p99=%dus p999=%dus err=%ld get_pct=%ld pattern=trace hint_lost=0 miss=%ld qps=%.0f\n",
+	printf("steady ops=%ld seconds=%.3f rate=%.0f/s p50=%dus p99=%dus p999=%dus err=%ld get_pct=%ld pattern=trace hint_lost=%ld miss=%ld qps=%.0f\n",
 	       done, dt, done / dt, all[done / 2], all[done * 99 / 100], all[done * 999 / 1000],
-	       err, gets * 100 / done, miss, qps);
+	       err, gets * 100 / done, hint_lost, miss, qps);
 	return 0;
 }
