@@ -16,6 +16,9 @@
 # QPS is set (else closed loop).  WARM past the end of the trace populates every
 # key the trace has, which makes the measured window free of cold starts.
 # MC_MEM (default 3072) is memcached's -m.
+# The daemon gets SIGUSR1 when the measured clients start (a mark in spd -F logs).
+# DISK=sda samples that /proc/diskstats row every second while the measured
+# clients run (VARIANT-BUDGET.disk) and prints a summary (VARIANT-BUDGET.disksum).
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 port=12346
@@ -28,8 +31,9 @@ seed=${SEED:-11}
 getpct=${GET_PCT:-95}
 settle=${SETTLE:-90}
 out=$(mktemp -d /tmp/mc-spd.XXXXXX)
-memc=; d=
+memc=; d=; mon=
 cleanup() {
+	[ -z "$mon" ] || kill "$mon" 2>/dev/null || :
 	[ -z "$d" ] || { kill -TERM "$d" 2>/dev/null || :; wait "$d" 2>/dev/null || :; }
 	[ -z "$memc" ] || { kill -TERM "$memc" 2>/dev/null || :; wait "$memc" 2>/dev/null || :; }
 }
@@ -84,6 +88,14 @@ for spec do
 		[ "$settle" -le 0 ] || sleep 10
 		idle=$((($(stat fault) - fi) / 10))
 	fi
+	[ -z "$d" ] || kill -USR1 "$d"
+	if [ -n "${DISK:-}" ]; then
+		while :; do
+			echo "$(date +%s.%N) $(awk -v d="$DISK" '$3 == d' /proc/diskstats)"
+			sleep 1
+		done > "$out/$variant-$budget.disk" &
+		mon=$!
+	fi
 	f0=$(stat fault)
 	if [ -n "${TRACE:-}" ] && [ "$variant" = oracle ]; then
 		"$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" "${SKIP:-$WARM}" "$ops" "${QPS:-0}" \
@@ -99,6 +111,23 @@ for spec do
 		"$here/mcbench" steady 127.0.0.1 "$port" "$threads" "$keys" "$value" "$ops" "$zipf" "$getpct" "$seed" > "$out/$variant-$budget.steady"
 	fi
 	f1=$(stat fault)
+	if [ -n "$mon" ]; then
+		kill "$mon" 2>/dev/null || :
+		wait "$mon" 2>/dev/null || :
+		mon=
+		# fields after the time stamp: 5 reads, 7 sectors, 8 ms; 9 writes, 11 sectors, 12 ms; 14 busy ms, 15 queue ms
+		awk 'NR == 1 { t0 = $1; for (i = 5; i <= 15; i++) a[i] = $i }
+		     NR > 1 && $5 > pr && ($8 - pm) / ($5 - pr) > worst { worst = ($8 - pm) / ($5 - pr) }
+		     { pr = $5; pm = $8; t = $1; for (i = 5; i <= 15; i++) b[i] = $i }
+		     END {
+			dt = t - t0; r = b[5] - a[5]; w = b[9] - a[9]
+			if (dt <= 0) exit
+			printf "seconds=%.0f read_iops=%.0f read_mb_s=%.1f read_wait_ms=%.2f worst_1s_read_wait_ms=%.2f write_iops=%.0f write_mb_s=%.1f write_wait_ms=%.2f util_pct=%.0f queue=%.1f\n",
+				dt, r / dt, (b[7] - a[7]) / 2048 / dt, r ? (b[8] - a[8]) / r : 0, worst,
+				w / dt, (b[11] - a[11]) / 2048 / dt, w ? (b[12] - a[12]) / w : 0,
+				(b[14] - a[14]) / 10 / dt, (b[15] - a[15]) / 1000 / dt
+		     }' "$out/$variant-$budget.disk" > "$out/$variant-$budget.disksum"
+	fi
 	head -3 /dev/ssdpager > "$out/$variant-$budget.module"
 	if [ -n "$d" ]; then
 		kill -TERM "$d"

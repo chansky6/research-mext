@@ -46,7 +46,13 @@ struct region {
 };
 
 static int fd, pid, predictor = P_NONE, hint_fd = -1;
-static FILE *fault_log;	/* -F: address of every demand fault, raw u64 */
+/*
+ * -F: raw u64 records in the order the prefetch thread saw them. A page
+ * address is a demand fault; with bit 63 set it is a hint read from the FIFO,
+ * with bit 62 set a page asked of SP_PROMOTEV. ~0 marks a SIGUSR1.
+ */
+static FILE *fault_log;
+static volatile sig_atomic_t mark;
 static unsigned long budget_pages, rate_pages = 20000;
 static unsigned int interval_ms = 1000, min_age = 1, pf_width = 8;
 static uint32_t tick;		/* one per scan; `last` stamps are ticks */
@@ -391,6 +397,12 @@ static void *prefetch_thread(void *arg)
 		if (ioctl(fd, SP_TRACE, &t))
 			die("SP_TRACE");
 		ev_lost = t.lost;
+		if (mark && fault_log) {
+			uint64_t m = ~0ULL;
+
+			mark = 0;
+			fwrite(&m, sizeof(m), 1, fault_log);
+		}
 		if (predictor == P_HINT) {
 			ssize_t r = read(hint_fd, cand, sizeof(cand));
 
@@ -457,6 +469,11 @@ static void *prefetch_thread(void *arg)
 					      .states = (uintptr_t)st };
 
 			pf_asked += nw;
+			for (i = 0; fault_log && i < nw; i++) {
+				uint64_t h = want[i] | 1ULL << 62;
+
+				fwrite(&h, sizeof(h), 1, fault_log);
+			}
 			if (ioctl(fd, SP_PROMOTEV, &v))
 				continue;
 			pf_done += v.done;
@@ -484,6 +501,11 @@ static void *prefetch_thread(void *arg)
 static void on_signal(int sig)
 {
 	stop = 1;
+}
+
+static void on_mark(int sig)
+{
+	mark = 1;
 }
 
 int main(int argc, char **argv)
@@ -518,7 +540,7 @@ int main(int argc, char **argv)
 			"           [-r evict_pages_per_s=20000] [-a min_age_scans=1]\n"
 			"           [-w prefetch_width=8] [-d prefetch_deadline_us=5000]\n"
 			"           [-H fifo]   with -P hint: page addresses (raw u64) to prefetch\n"
-			"           [-F file]   log demand-fault addresses and, with bit 63 set, hints (raw u64)\n");
+			"           [-F file]   log demand faults, hints (bit 63), prefetches (bit 62), SIGUSR1 (~0); raw u64\n");
 		return 2;
 	}
 	if (hint_path && (hint_fd = open(hint_path, O_RDONLY | O_NONBLOCK)) < 0)
@@ -533,6 +555,7 @@ int main(int argc, char **argv)
 		die("calloc");
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
+	signal(SIGUSR1, on_mark);
 	pthread_create(&ts, NULL, scan_thread, NULL);
 	pthread_create(&tp, NULL, prefetch_thread, NULL);
 	pthread_join(ts, NULL);
