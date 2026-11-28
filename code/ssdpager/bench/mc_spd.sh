@@ -9,6 +9,8 @@
 # PATTERN=run:L or session:S:L replaces the Zipf clients with bench/mcloc.
 # Variant oracle (needs PATTERN, or TRACE with TRACE_MAP): the client tells spd
 # which pages each request LOOKAHEAD (default 256) requests ahead will touch.
+# CHAIN=1 (TRACE oracle only) also hints the hash-bucket items assoc_find()
+# walks through before each requested item.
 # SPD_OPTS adds spd options.
 # TRACE=FILE (from bench/twprep.py) replays a request trace with bench/mctrace
 # instead: records [0, WARM) fill the cache before the daemon starts, records
@@ -61,7 +63,7 @@ for spec do
 	fi
 	if [ -n "${TRACE:-}" ] && [ -n "${TRACE_MAP:-}" ]; then
 		# item address of every key and the region layout, before anything is evicted
-		"$here/bench/mctrace" map "$memc" "$TRACE_MAP" "$out/$variant-$budget.imap" > "$out/$variant-$budget.mapout"
+		"$here/bench/mctrace" map "$memc" "$TRACE_MAP" "$out/$variant-$budget.imap" ${CHAIN:+"$out/$variant-$budget.chain"} > "$out/$variant-$budget.mapout"
 		cp "/proc/$memc/maps" "$out/$variant-$budget.maps"
 	fi
 	if [ "$variant" = oracle ]; then
@@ -99,7 +101,7 @@ for spec do
 	f0=$(stat fault)
 	if [ -n "${TRACE:-}" ] && [ "$variant" = oracle ]; then
 		"$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" "${SKIP:-$WARM}" "$ops" "${QPS:-0}" \
-			"$out/$variant-$budget.imap" "$out/hints" "${LOOKAHEAD:-256}" > "$out/$variant-$budget.steady"
+			"$out/$variant-$budget.imap" "$out/hints" "${LOOKAHEAD:-256}" ${CHAIN:+"$out/$variant-$budget.chain"} > "$out/$variant-$budget.steady"
 	elif [ -n "${TRACE:-}" ]; then
 		"$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" "${SKIP:-$WARM}" "$ops" "${QPS:-0}" > "$out/$variant-$budget.steady"
 	elif [ "$variant" = oracle ]; then

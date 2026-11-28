@@ -15,9 +15,12 @@
  * Oracle hints: given the item map `mctrace map` wrote (take it while
  * everything is in DRAM), a FIFO and LOOKAHEAD, each connection writes the
  * pages of the item it will ask for LOOKAHEAD of its own requests from now to
- * the FIFO as raw u64 addresses (spd -P hint).  Only the item itself is known:
- * no hash-chain or LRU neighbours.  A SET moves the item, so its key is not
- * hinted again.
+ * the FIFO as raw u64 addresses (spd -P hint).  A SET moves the item, so its
+ * key is not hinted again.  Without CHAIN only the item itself is hinted.
+ * CHAIN (written by `mctrace map ... CHAIN`) names, per key, the items
+ * assoc_find() compares before reaching it (its hash bucket from the head
+ * down, found by inverting h_next, at most CHAIN_UP of them); their header and
+ * key pages are hinted too.  LRU neighbours are never hinted.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -70,6 +73,9 @@ static int port, threads, hint_fd = -1;
 static struct addr *imap;	/* item of each key, addr 0 when unknown */
 static unsigned long imap_keys;
 static long lookahead;
+#define CHAIN_UP	7
+#define NOKEY		0xffffffffU
+static uint32_t *chain;		/* CHAIN_UP keys per key, nearest first, NOKEY when none */
 static const struct rec *trace;
 static long ops;
 static double qps;
@@ -133,14 +139,26 @@ static double since_start(void)
 
 static void hint(struct worker *w, uint32_t key)
 {
-	uint64_t pages[4], a, end;
+	uint64_t pages[4 + 2 * CHAIN_UP], a, end;
 	size_t n = 0;
+	int e;
 
 	if (key >= imap_keys || !imap[key].addr)
 		return;
 	end = imap[key].addr + 56 + imap[key].ksize + imap[key].nbytes + 2;
 	for (a = imap[key].addr & ~(PG - 1); a < end && n < 4; a += PG)
 		pages[n++] = a;
+	for (e = 0; chain && e < CHAIN_UP; e++) {
+		uint32_t k = chain[(size_t)key * CHAIN_UP + e];
+
+		if (k == NOKEY)
+			break;
+		if (!imap[k].addr)
+			continue;
+		end = imap[k].addr + 56 + imap[k].ksize;
+		for (a = imap[k].addr & ~(PG - 1); a < end; a += PG)
+			pages[n++] = a;
+	}
 	if (write(hint_fd, pages, n * sizeof(*pages)) < 0)
 		w->hint_lost++;
 }
@@ -237,6 +255,7 @@ static int cmp_int(const void *x, const void *y)
 /* ---- map: every key's item address, for page-level analysis ---------------- */
 
 #define IT_PAD		48	/* key offset when the item carries no CAS field */
+#define IT_HNEXT	16
 #define SCAN_CHUNK	(4UL << 20)
 #define SCAN_CARRY	512UL
 
@@ -277,15 +296,83 @@ static unsigned int item_at(const unsigned char *b, size_t i, unsigned int *k, u
 	return 0;
 }
 
-static int do_map(int pid, unsigned long nkeys, const char *out)
+struct ak {
+	uint64_t addr;
+	uint32_t key;
+};
+
+static int cmp_ak(const void *x, const void *y)
+{
+	uint64_t a = ((const struct ak *)x)->addr, b = ((const struct ak *)y)->addr;
+
+	return (a > b) - (a < b);
+}
+
+/* For every key, the keys whose items precede it in its hash bucket. */
+static void write_chain(const struct addr *map, const uint64_t *hnext, unsigned long nkeys, const char *out)
+{
+	struct ak *by = malloc(nkeys * sizeof(*by)), want;
+	uint32_t *pred = malloc(nkeys * sizeof(*pred));
+	uint32_t *ch = malloc(nkeys * CHAIN_UP * sizeof(*ch));
+	unsigned long k, n = 0, links = 0, hist[CHAIN_UP + 1] = { 0 };
+	FILE *f;
+	int e, j;
+
+	if (!by || !pred || !ch)
+		die("malloc");
+	for (k = 0; k < nkeys; k++) {
+		pred[k] = NOKEY;
+		if (map[k].addr)
+			by[n++] = (struct ak){ map[k].addr, k };
+	}
+	qsort(by, n, sizeof(*by), cmp_ak);
+	for (k = 0; k < nkeys; k++) {
+		struct ak *hit;
+
+		if (!map[k].addr || !hnext[k])
+			continue;
+		want.addr = hnext[k];
+		hit = bsearch(&want, by, n, sizeof(*by), cmp_ak);
+		if (hit) {
+			pred[hit->key] = k;
+			links++;
+		}
+	}
+	for (k = 0; k < nkeys; k++) {
+		uint32_t cur = map[k].addr ? k : NOKEY;
+
+		for (e = 0; e < CHAIN_UP && cur != NOKEY; e++) {
+			cur = pred[cur];
+			if (cur == NOKEY)
+				break;
+			ch[k * CHAIN_UP + e] = cur;
+		}
+		for (j = e; j < CHAIN_UP; j++)
+			ch[k * CHAIN_UP + j] = NOKEY;
+		hist[e] += !!map[k].addr;
+	}
+	f = fopen(out, "w");
+	if (!f || fwrite(ch, sizeof(*ch), nkeys * CHAIN_UP, f) != nkeys * CHAIN_UP || fclose(f))
+		die(out);
+	printf("chain links=%lu items by ancestors (0..%d+):", links, CHAIN_UP);
+	for (e = 0; e <= CHAIN_UP; e++)
+		printf(" %lu", hist[e]);
+	printf("\n");
+}
+
+static int do_map(int pid, unsigned long nkeys, const char *out, const char *chain_out)
 {
 	unsigned char *buf = malloc(SCAN_CARRY + SCAN_CHUNK);
 	char path[64], line[512];
 	struct addr *map = calloc(nkeys, sizeof(*map));
+	uint64_t *hnext = calloc(nkeys, sizeof(*hnext));
 	unsigned long cand = 0, bytes = 0;
 	unsigned long found = 0, dup = 0;
 	FILE *maps, *f;
 	int mem;
+
+	if (!hnext)
+		die("calloc");
 
 	snprintf(path, sizeof(path), "/proc/%d/maps", pid);
 	maps = fopen(path, "r");
@@ -329,6 +416,7 @@ static int do_map(int pid, unsigned long nkeys, const char *out)
 					map[k].addr = at;
 					memcpy(&map[k].nbytes, buf + i - hdr + IT_NBYTES, 4);
 					map[k].ksize = nk;
+					memcpy(&hnext[k], buf + i - hdr + IT_HNEXT, 8);
 					found++;
 				}
 			}
@@ -342,6 +430,8 @@ static int do_map(int pid, unsigned long nkeys, const char *out)
 	if (!f || fwrite(map, sizeof(*map), nkeys, f) != nkeys || fclose(f))
 		die(out);
 	printf("map items=%lu dup=%lu scanned=%lu MiB candidates=%lu\n", found, dup, bytes >> 20, cand);
+	if (chain_out)
+		write_chain(map, hnext, nkeys, chain_out);
 	return 0;
 }
 
@@ -355,11 +445,11 @@ int main(int argc, char **argv)
 	double dt;
 	void *m;
 
-	if (argc == 5 && !strcmp(argv[1], "map"))
-		return do_map(atoi(argv[2]), strtoul(argv[3], NULL, 10), argv[4]);
-	if (argc != 7 && argc != 8 && argc != 11) {
-		fprintf(stderr, "usage: mctrace host port threads TRACE skip ops [qps [MAP FIFO lookahead]]\n"
-				"       mctrace map PID keys MAP\n");
+	if ((argc == 5 || argc == 6) && !strcmp(argv[1], "map"))
+		return do_map(atoi(argv[2]), strtoul(argv[3], NULL, 10), argv[4], argc == 6 ? argv[5] : NULL);
+	if (argc != 7 && argc != 8 && argc != 11 && argc != 12) {
+		fprintf(stderr, "usage: mctrace host port threads TRACE skip ops [qps [MAP FIFO lookahead [CHAIN]]]\n"
+				"       mctrace map PID keys MAP [CHAIN]\n");
 		return 2;
 	}
 	host = argv[1];
@@ -368,7 +458,7 @@ int main(int argc, char **argv)
 	skip = atol(argv[5]);
 	ops = atol(argv[6]);
 	qps = argc >= 8 ? atof(argv[7]) : 0;
-	if (argc == 11) {
+	if (argc >= 11) {
 		FILE *f = fopen(argv[8], "r");
 
 		if (!f || fseek(f, 0, SEEK_END))
@@ -383,6 +473,15 @@ int main(int argc, char **argv)
 		if (hint_fd < 0)
 			die(argv[9]);
 		lookahead = atol(argv[10]);
+		if (argc == 12) {
+			size_t nc = imap_keys * CHAIN_UP;
+
+			f = fopen(argv[11], "r");
+			chain = malloc(nc * sizeof(*chain));
+			if (!f || !chain || fread(chain, sizeof(*chain), nc, f) != nc)
+				die(argv[11]);
+			fclose(f);
+		}
 	}
 	fd = open(argv[4], O_RDONLY);
 	if (fd < 0 || fstat(fd, &st))
