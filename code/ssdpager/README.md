@@ -40,6 +40,9 @@ TRACE=c52.bin WARM=20000000 OPS=2000000 SETTLE=180 MC_OPTS="-o no_lru_crawler" s
 bench/mctrace map PID KEYS MAP      # 每个 key 的条目地址（u64 addr, u32 nbytes, u32 ksize），用于页级分析
 #   TRACE_MAP=KEYS 让 mc_spd.sh 在预热后、换出前自动取 map（$variant-$budget.imap）和 /proc/PID/maps，配合 SPD_OPTS="-F file" 做缺页归属（报告 §5.15）
 #   MC_MEM 覆盖 memcached 的 -m（默认 3072）
+#   PREWIN=N：不静置，daemon 启动后先放窗口前 N 条记录里的 GET（不回填），页龄来自真实流量（报告 §5.17）
+#   DISK=sda：逐秒采样盘；trace 回放时 disksum 另按写等待 8 ms 分 fast / slow 两段给 ops/s（写悬崖，报告 §5.14.3）
+TRACE=c52.bin TRACE_MAP=4776681 WARM=40000000 SKIP=20000000 OPS=2000000 PREWIN=6000000 DISK=sda CHAIN=1 MC_OPTS="-o no_lru_crawler" sh bench/mc_spd.sh oracle:716
 ./sptest evict PID; ./sptest promote PID; ./sptest evacuate; ./sptest stat
 ```
 

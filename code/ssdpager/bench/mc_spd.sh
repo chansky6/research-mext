@@ -17,10 +17,16 @@
 # [SKIP, SKIP+OPS) are measured (SKIP defaults to WARM), at QPS requests/s when
 # QPS is set (else closed loop).  WARM past the end of the trace populates every
 # key the trace has, which makes the measured window free of cold starts.
+# PREWIN=N (TRACE only) replaces the idle settle: the daemon reaches the budget
+# while the GETs of records [SKIP-N, SKIP) run (with hints under oracle), so page
+# ages come from the traffic right before the window and no item moves.
 # MC_MEM (default 3072) is memcached's -m.
 # The daemon gets SIGUSR1 when the measured clients start (a mark in spd -F logs).
 # DISK=sda samples that /proc/diskstats row every second while the measured
 # clients run (VARIANT-BUDGET.disk) and prints a summary (VARIANT-BUDGET.disksum).
+# With TRACE the summary also splits the run by disk state: a second is "slow"
+# when its writes waited over 8 ms on average (the SSD's sustained-write cliff,
+# report §5.14.3), and gives the request rate in each state.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 port=12346
@@ -83,7 +89,15 @@ for spec do
 		# the daemon runs while the cache fills, so its page ages come from real traffic
 		"$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" 0 "$WARM" > "$out/$variant-$budget.preload"
 	fi
-	if [ -n "$d" ]; then
+	if [ -n "$d" ] && [ -n "${PREWIN:-}" ] && [ -n "${TRACE:-}" ]; then
+		pre0=$((${SKIP:-$WARM} - PREWIN))
+		if [ "$variant" = oracle ]; then
+			MCTRACE_GETS_ONLY=1 "$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" "$pre0" "$PREWIN" 0 \
+				"$out/$variant-$budget.imap" "$out/hints" "${LOOKAHEAD:-256}" ${CHAIN:+"$out/$variant-$budget.chain"} > "$out/$variant-$budget.prewin"
+		else
+			MCTRACE_GETS_ONLY=1 "$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" "$pre0" "$PREWIN" > "$out/$variant-$budget.prewin"
+		fi
+	elif [ -n "$d" ]; then
 		# let the daemon reach the budget while the keyspace is idle
 		[ "$((settle - 10))" -le 0 ] || sleep "$((settle - 10))"
 		fi=$(stat fault)
@@ -99,6 +113,7 @@ for spec do
 		mon=$!
 	fi
 	f0=$(stat fault)
+	export MCTRACE_PROGRESS="$out/$variant-$budget.ops"
 	if [ -n "${TRACE:-}" ] && [ "$variant" = oracle ]; then
 		"$here/bench/mctrace" 127.0.0.1 "$port" "$threads" "$TRACE" "${SKIP:-$WARM}" "$ops" "${QPS:-0}" \
 			"$out/$variant-$budget.imap" "$out/hints" "${LOOKAHEAD:-256}" ${CHAIN:+"$out/$variant-$budget.chain"} > "$out/$variant-$budget.steady"
@@ -112,6 +127,7 @@ for spec do
 	else
 		"$here/mcbench" steady 127.0.0.1 "$port" "$threads" "$keys" "$value" "$ops" "$zipf" "$getpct" "$seed" > "$out/$variant-$budget.steady"
 	fi
+	unset MCTRACE_PROGRESS
 	f1=$(stat fault)
 	if [ -n "$mon" ]; then
 		kill "$mon" 2>/dev/null || :
@@ -129,6 +145,22 @@ for spec do
 				w / dt, (b[11] - a[11]) / 2048 / dt, w ? (b[12] - a[12]) / w : 0,
 				(b[14] - a[14]) / 10 / dt, (b[15] - a[15]) / 1000 / dt
 		     }' "$out/$variant-$budget.disk" > "$out/$variant-$budget.disksum"
+		if [ -s "$out/$variant-$budget.ops" ]; then
+			awk 'NR == FNR { ot[++n] = $1; od[n] = $2; next }
+			     function done_at(t) { while (j < n && ot[j + 1] <= t) j++; return od[j] + 0 }
+			     FNR > 1 {
+				if ($9 > pc) s = ($12 - pw) / ($9 - pc) > 8 ? "slow" : "fast"
+				d = done_at($1)
+				sec[s] += $1 - pt; op[s] += d - pd; rd[s] += $5 - pr; rm[s] += $8 - pm
+			     }
+			     { if (FNR == 1) { s = "fast"; d = done_at($1) }
+			       pt = $1; pc = $9; pw = $12; pr = $5; pm = $8; pd = d }
+			     END {
+				for (s in sec)
+					printf "%s seconds=%.0f ops_s=%.0f read_iops=%.0f read_wait_ms=%.2f\n",
+						s, sec[s], op[s] / sec[s], rd[s] / sec[s], rd[s] ? rm[s] / rd[s] : 0
+			     }' "$out/$variant-$budget.ops" "$out/$variant-$budget.disk" >> "$out/$variant-$budget.disksum"
+		fi
 	fi
 	head -3 /dev/ssdpager > "$out/$variant-$budget.module"
 	if [ -n "$d" ]; then

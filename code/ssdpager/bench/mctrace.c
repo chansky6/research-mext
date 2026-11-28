@@ -79,6 +79,9 @@ static uint32_t *chain;		/* CHAIN_UP keys per key, nearest first, NOKEY when non
 static const struct rec *trace;
 static long ops;
 static double qps;
+static int gets_only;		/* MCTRACE_GETS_ONLY: send the GETs only, refill nothing, so no item moves */
+static struct worker *workers;
+static const char *progress_path;	/* MCTRACE_PROGRESS: "epoch requests-done" every 200 ms */
 static struct timespec start;
 static char *value;
 
@@ -183,10 +186,10 @@ static void *work(void *p)
 		double due = qps > 0 ? i / qps : 0, now;
 		int n, res, set;
 
-		if (r->key % threads != w->id)
+		if (r->key % threads != w->id || (gets_only && r->op))
 			continue;
 		for (; imap && w->ahead < ops && w->hinted <= w->done + lookahead; w->ahead++) {
-			if (trace[w->ahead].key % threads != w->id)
+			if (trace[w->ahead].key % threads != w->id || (gets_only && trace[w->ahead].op))
 				continue;
 			w->hinted++;
 			hint(w, trace[w->ahead].key);
@@ -215,7 +218,7 @@ static void *work(void *p)
 		} else {
 			res = 0;
 		}
-		if (res >= 0 && r->op != 2 && (set || res == 1)) {
+		if (res >= 0 && !gets_only && r->op != 2 && (set || res == 1)) {
 			int timed = set;
 			double t = since_start();
 
@@ -435,9 +438,31 @@ static int do_map(int pid, unsigned long nkeys, const char *out, const char *cha
 	return 0;
 }
 
+static void *progress(void *p)
+{
+	FILE *f = fopen(progress_path, "w");
+
+	if (!f)
+		die(progress_path);
+	for (;;) {
+		struct timespec ts;
+		long n = 0;
+		int t;
+
+		clock_gettime(CLOCK_REALTIME, &ts);
+		for (t = 0; t < threads; t++)
+			n += __atomic_load_n(&workers[t].done, __ATOMIC_RELAXED);
+		fprintf(f, "%ld.%03ld %ld\n", (long)ts.tv_sec, ts.tv_nsec / 1000000, n);
+		fflush(f);
+		usleep(200000);
+	}
+	return p;
+}
+
 int main(int argc, char **argv)
 {
 	struct worker *w;
+	pthread_t pt;
 	struct timespec t1;
 	struct stat st;
 	long done = 0, err = 0, gets = 0, miss = 0, hint_lost = 0, skip, i;
@@ -458,6 +483,7 @@ int main(int argc, char **argv)
 	skip = atol(argv[5]);
 	ops = atol(argv[6]);
 	qps = argc >= 8 ? atof(argv[7]) : 0;
+	gets_only = getenv("MCTRACE_GETS_ONLY") != NULL;
 	if (argc >= 11) {
 		FILE *f = fopen(argv[8], "r");
 
@@ -505,6 +531,10 @@ int main(int argc, char **argv)
 		if (pthread_create(&w[t].th, NULL, work, &w[t]))
 			die("pthread_create");
 	}
+	workers = w;
+	progress_path = getenv("MCTRACE_PROGRESS");
+	if (progress_path && pthread_create(&pt, NULL, progress, NULL))
+		die("pthread_create");
 	for (t = 0; t < threads; t++) {
 		pthread_join(w[t].th, NULL);
 		memcpy(all + done, w[t].lat, w[t].done * sizeof(int));
